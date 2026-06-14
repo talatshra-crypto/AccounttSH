@@ -3,13 +3,14 @@
 نظام ادارة المخازن والمحاسبة
 يعمل بـ Python فقط - بدون اي مكتبات خارجية
 """
-import sqlite3, json, os, sys, hashlib, time, webbrowser, threading
+import sqlite3, json, os, sys, hashlib, time, webbrowser, threading, signal
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-import os
 PORT = int(os.environ.get('PORT', 8080))
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inventory.db")
+# Railway: استخدام /tmp للبيانات المؤقتة أو مسار قابل للكتابة
+_base = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.path.join(_base, "inventory.db")
 
 # ══════════════════════════════════════════════
 #  قاعدة البيانات
@@ -2262,9 +2263,16 @@ if __name__ == "__main__":
     print(f"\n لايقاف البرنامج: اضغط Ctrl+C")
     print("=" * 48)
 
-    # لا نفتح المتصفح على السيرفر
+    # Railway deployment
     server = HTTPServer(("0.0.0.0", PORT), Handler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n تم ايقاف السيرفر")
+    print(f"✅ Server running on port {PORT}")
+    
+    def shutdown(sig, frame):
+        print("\n⛔ Shutting down...")
+        server.shutdown()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    
+    server.serve_forever()
