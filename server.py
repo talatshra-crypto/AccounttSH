@@ -137,6 +137,21 @@ def init_db():
         qty INTEGER DEFAULT 1,
         price REAL DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS payments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ref_type TEXT NOT NULL,
+        ref_id INTEGER NOT NULL,
+        party_type TEXT NOT NULL,
+        party_id INTEGER NOT NULL,
+        amount REAL NOT NULL,
+        method TEXT DEFAULT 'نقدي',
+        cheque_no TEXT DEFAULT '',
+        cheque_date TEXT DEFAULT '',
+        cheque_bank TEXT DEFAULT '',
+        notes TEXT DEFAULT '',
+        date TEXT NOT NULL,
+        created_at TEXT DEFAULT(datetime('now'))
+    );
     """)
     if not row1(c.execute("SELECT id FROM users WHERE username='admin'")):
         c.execute("INSERT INTO users(username,password,full_name,role) VALUES(?,?,?,?)",
@@ -504,6 +519,94 @@ def handle_api(method, path, body, req):
         c.close()
         return 200,{"supplier":sup,"purchases":ps,"total":total,
                     "date_from":date_from,"date_to":date_to,"count":len(ps)}
+
+    # ── PAYMENTS ──
+    if ep == "payments":
+        if method == "GET":
+            ref_type = qs.get("ref_type",[""])[0]
+            ref_id   = qs.get("ref_id",[""])[0]
+            party_type = qs.get("party_type",[""])[0]
+            party_id   = qs.get("party_id",[""])[0]
+            if ref_type and ref_id:
+                ps = rows(c.execute(
+                    "SELECT * FROM payments WHERE ref_type=? AND ref_id=? ORDER BY date DESC",
+                    (ref_type, int(ref_id))))
+            elif party_type and party_id:
+                ps = rows(c.execute(
+                    "SELECT * FROM payments WHERE party_type=? AND party_id=? ORDER BY date DESC",
+                    (party_type, int(party_id))))
+            else:
+                ps = rows(c.execute("SELECT * FROM payments ORDER BY id DESC LIMIT 100"))
+            c.close(); return 200, ps
+
+        if method == "POST":
+            amount = float(body.get("amount", 0))
+            if amount <= 0:
+                c.close(); return 400, {"detail": "المبلغ يجب أن يكون أكبر من صفر"}
+            cur = c.execute(
+                "INSERT INTO payments(ref_type,ref_id,party_type,party_id,amount,method,cheque_no,cheque_date,cheque_bank,notes,date) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (body.get("ref_type",""), int(body.get("ref_id",0)),
+                 body.get("party_type",""), int(body.get("party_id",0)),
+                 amount, body.get("method","نقدي"),
+                 body.get("cheque_no",""), body.get("cheque_date",""),
+                 body.get("cheque_bank",""), body.get("notes",""),
+                 body.get("date","")))
+            c.commit()
+
+            # تحديث حالة الفاتورة تلقائياً
+            ref_type = body.get("ref_type","")
+            ref_id   = int(body.get("ref_id",0))
+            table    = "purchases" if ref_type=="purchase" else "sales"
+            inv      = row1(c.execute(f"SELECT * FROM {table} WHERE id=?", (ref_id,)))
+            if inv:
+                paid_total = c.execute(
+                    "SELECT COALESCE(SUM(amount),0) FROM payments WHERE ref_type=? AND ref_id=?",
+                    (ref_type, ref_id)).fetchone()[0]
+                inv_total = abs(inv["total"])
+                if paid_total >= inv_total:
+                    new_status = "مدفوع"
+                elif paid_total > 0:
+                    new_status = "مدفوع جزئياً"
+                else:
+                    new_status = "معلق"
+                c.execute(f"UPDATE {table} SET status=? WHERE id=?", (new_status, ref_id))
+                c.commit()
+
+            pay = row1(c.execute("SELECT * FROM payments WHERE id=?", (cur.lastrowid,)))
+            c.close(); return 201, pay
+
+        if method == "DELETE" and len(parts)==3:
+            c.execute("DELETE FROM payments WHERE id=?", (int(parts[2]),))
+            c.commit(); c.close(); return 200, {"ok": True}
+
+    # ── PAYMENTS SUMMARY ──
+    if ep == "payments_summary":
+        party_type = qs.get("party_type",[""])[0]
+        party_id   = int(qs.get("party_id",[0])[0])
+        # جلب كل الفواتير
+        if party_type == "supplier":
+            invs = rows(c.execute(
+                "SELECT * FROM purchases WHERE CAST(supplier_id AS INTEGER)=? AND status!='مردود'",
+                (party_id,)))
+            ref_type = "purchase"
+        else:
+            invs = rows(c.execute(
+                "SELECT * FROM sales WHERE CAST(customer_id AS INTEGER)=?", (party_id,)))
+            ref_type = "sale"
+        # حساب المدفوع لكل فاتورة
+        result = []
+        total_inv = 0; total_paid = 0
+        for inv in invs:
+            paid = c.execute(
+                "SELECT COALESCE(SUM(amount),0) FROM payments WHERE ref_type=? AND ref_id=?",
+                (ref_type, inv["id"])).fetchone()[0]
+            remaining = abs(inv["total"]) - paid
+            total_inv  += abs(inv["total"])
+            total_paid += paid
+            result.append({**inv, "paid": paid, "remaining": remaining})
+        c.close()
+        return 200, {"invoices": result, "total_invoices": total_inv,
+                     "total_paid": total_paid, "total_remaining": total_inv - total_paid}
 
     # ── UPDATE PURCHASE ──
     if ep == "purchases" and method == "PUT" and len(parts) == 3:
@@ -897,9 +1000,11 @@ function purRows(list){
     <td><span class="badge ${p.status==='مدفوع'?'g':p.status==='معلق'?'y':'b'}">${p.status}</span></td>
     <td>
       <div style="display:flex;gap:4px;flex-wrap:wrap;">
-        <button class="btn s" style="padding:3px 8px;font-size:11px;" onclick="togPur(${p.id})">📋</button>
-        <button class="btn s" style="padding:3px 8px;font-size:11px;" onclick="editPur(${p.id})">✏️</button>
-        <button class="btn s" style="padding:3px 8px;font-size:11px;color:#fbbf24;border-color:#5c4a23;" onclick="returnPur(${p.id})">↩️ مردود</button>
+        <button class="btn s" style="padding:3px 8px;font-size:11px;" onclick="togPur(${p.id})">📋 تفاصيل</button>
+        <button class="btn s" style="padding:3px 8px;font-size:11px;" onclick="editPur(${p.id})">✏️ تعديل</button>
+        ${p.status!=='مردود'?`<button class="btn p" style="padding:3px 8px;font-size:11px;background:linear-gradient(135deg,#1e40af,#1e3a8a);" onclick="openPay(${p.id},'purchase')">💳 دفعة</button>`:''}
+        ${p.status!=='مردود'?`<button class="btn s" style="padding:3px 8px;font-size:11px;" onclick="viewPayHist(${p.id},'purchase')">📊 الدفعات</button>`:''}
+        ${p.status!=='مردود'?`<button class="btn s" style="padding:3px 8px;font-size:11px;color:#fbbf24;border-color:#5c4a23;" onclick="returnPur(${p.id})">↩️ مردود</button>`:''}
         <button class="btn d" style="padding:3px 8px;font-size:11px;" onclick="deletePur(${p.id})">🗑️</button>
       </div>
     </td>
@@ -1059,6 +1164,13 @@ function accountingHTML(){
   const totalReceive = custStats.reduce((s,x)=>s+x.salePending, 0);
 
   return `<div class="ti">الحسابات</div><div class="sub">المتابعة المالية الشاملة</div>
+  <div style="display:flex;gap:8px;margin-bottom:16px;">
+    <button class="btn p" id="acc-tab-sum" onclick="accTab('sum')">ملخص</button>
+    <button class="btn s" id="acc-tab-sup" onclick="accTab('sup')">كشف موردين</button>
+    <button class="btn s" id="acc-tab-cust" onclick="accTab('cust')">كشف زبائن</button>
+    <button class="btn s" id="acc-tab-pays" onclick="accTab('pays')">سجل الدفعات</button>
+  </div>
+  <div id="acc-content">
 
   <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px;">
     <div class="stat">
@@ -1121,7 +1233,145 @@ function accountingHTML(){
       </div>`).join('') : '<div style="color:#64748b;text-align:center;padding:20px;">لا يوجد زبائن</div>'}
     </div>
 
+  </div></div>
   </div>`;
+}
+
+window.accTab = async function(tab){
+  document.querySelectorAll('[id^="acc-tab-"]').forEach(b=>{
+    b.className = b.id==='acc-tab-'+tab ? 'btn p' : 'btn s';
+  });
+  const el = document.getElementById('acc-content');
+  if(!el) return;
+
+  if(tab==='sum'){
+    el.innerHTML = document.getElementById('acc-sum-content')?.innerHTML || '';
+    return;
+  }
+
+  if(tab==='pays'){
+    el.innerHTML='<div class="spin"></div>';
+    try{
+      const pays = await api('GET','/api/payments');
+      el.innerHTML = pays.length
+        ? '<div class="card"><table>'
+          + '<thead><tr><th>التاريخ</th><th>النوع</th><th>المبلغ</th><th>الطريقة</th><th>رقم الشيك</th><th>البنك</th><th>ملاحظات</th></tr></thead><tbody>'
+          + pays.map(p=>{
+              const inv = p.ref_type==='purchase'
+                ? purchases.find(x=>x.id===p.ref_id)
+                : sales.find(x=>x.id===p.ref_id);
+              const party = p.party_type==='supplier'
+                ? suppliers.find(s=>s.id===parseInt(p.party_id))?.name||'—'
+                : customers.find(c=>c.id===parseInt(p.party_id))?.name||'—';
+              return '<tr>'
+                + '<td style="font-weight:600;">'+p.date+'</td>'
+                + '<td><div style="font-size:12px;"><span class="badge '+(p.ref_type==='purchase'?'b':'g')+'">'+(p.ref_type==='purchase'?'شراء':'بيع')+'</span><div style="color:#94a3b8;font-size:11px;margin-top:2px;">'+party+'</div></div></td>'
+                + '<td style="font-weight:800;color:#52b788;">'+p.amount.toLocaleString()+' ر.س</td>'
+                + '<td><span class="badge '+(p.method==='نقدي'?'g':p.method==='شيك'?'b':'y')+'">'+p.method+'</span></td>'
+                + '<td style="font-family:monospace;color:#60a5fa;">'+(p.cheque_no||'—')+'</td>'
+                + '<td style="font-size:12px;color:#94a3b8;">'+(p.cheque_bank||'—')+'</td>'
+                + '<td style="font-size:12px;color:#64748b;">'+(p.notes||'')+'</td>'
+              + '</tr>';
+            }).join('')
+          + '</tbody></table></div>'
+          + '<div style="text-align:left;padding:12px 16px;font-size:15px;font-weight:800;color:#52b788;background:#161923;border-radius:8px;margin-top:8px;">'
+          + 'إجمالي الدفعات: '+pays.reduce((s,p)=>s+p.amount,0).toLocaleString()+' ر.س</div>'
+        : '<div style="text-align:center;color:#64748b;padding:30px;">لا توجد دفعات مسجلة</div>';
+    }catch(e){ el.innerHTML='<div class="err">خطأ: '+e.message+'</div>'; }
+    return;
+  }
+
+  if(tab==='sup'){
+    const rows = supStats.map(s=>`
+    <div class="card" style="margin-bottom:10px;padding:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <div style="font-weight:700;color:#f1f5f9;font-size:15px;">${s.name}</div>
+        <button class="btn p" style="padding:5px 12px;font-size:12px;background:linear-gradient(135deg,#1e40af,#1e3a8a);"
+          onclick="openSupPaySummary(${s.id})">💳 كشف الحساب</button>
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;">
+        <span class="badge b">${s.purCount} فاتورة</span>
+        <span style="color:#60a5fa;font-weight:700;">${s.purTotal.toLocaleString()} ر.س إجمالي</span>
+        ${s.purPaid>0?`<span class="badge g">مدفوع: ${s.purPaid.toLocaleString()} ر.س</span>`:''}
+        ${s.purPending>0?`<span class="badge r">معلق: ${s.purPending.toLocaleString()} ر.س</span>`:''}
+      </div>
+    </div>`).join('');
+    el.innerHTML = rows || '<div style="color:#64748b;text-align:center;padding:20px;">لا يوجد موردون</div>';
+    return;
+  }
+
+  if(tab==='cust'){
+    const rows = custStats.map(c=>`
+    <div class="card" style="margin-bottom:10px;padding:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <div style="font-weight:700;color:#f1f5f9;font-size:15px;">${c.name}</div>
+        <button class="btn p" style="padding:5px 12px;font-size:12px;"
+          onclick="openCustPaySummary(${c.id})">📊 كشف الحساب</button>
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;">
+        <span class="badge b">${c.saleCount} فاتورة</span>
+        <span style="color:#52b788;font-weight:700;">${c.saleTotal.toLocaleString()} ر.س إجمالي</span>
+        ${c.salePaid>0?`<span class="badge g">مدفوع: ${c.salePaid.toLocaleString()} ر.س</span>`:''}
+        ${c.salePending>0?`<span class="badge y">معلق: ${c.salePending.toLocaleString()} ر.س</span>`:''}
+      </div>
+    </div>`).join('');
+    el.innerHTML = rows || '<div style="color:#64748b;text-align:center;padding:20px;">لا يوجد زبائن</div>';
+    return;
+  }
+};
+
+window.openSupPaySummary = async function(sup_id){
+  const sup = suppliers.find(s=>s.id===sup_id);
+  if(!sup) return;
+  const el = document.getElementById('acc-content');
+  if(el) el.innerHTML='<div class="spin"></div>';
+  try{
+    const data = await api('GET','/api/payments_summary?party_type=supplier&party_id='+sup_id);
+    if(el) el.innerHTML = paySummaryHTML(data, sup.name, 'supplier');
+  }catch(e){ if(el) el.innerHTML='<div class="err">'+e.message+'</div>'; }
+};
+
+window.openCustPaySummary = async function(cust_id){
+  const cust = customers.find(c=>c.id===cust_id);
+  if(!cust) return;
+  const el = document.getElementById('acc-content');
+  if(el) el.innerHTML='<div class="spin"></div>';
+  try{
+    const data = await api('GET','/api/payments_summary?party_type=customer&party_id='+cust_id);
+    if(el) el.innerHTML = paySummaryHTML(data, cust.name, 'customer');
+  }catch(e){ if(el) el.innerHTML='<div class="err">'+e.message+'</div>'; }
+};
+
+function paySummaryHTML(data, name, party_type){
+  const {invoices, total_invoices, total_paid, total_remaining} = data;
+  const ref_type = party_type==='supplier' ? 'purchase' : 'sale';
+  return '<div>'
+  + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">'
+    + '<div style="font-size:16px;font-weight:800;color:#f1f5f9;">كشف حساب: '+name+'</div>'
+    + '<button class="btn s" style="font-size:12px;" onclick="accTab('sum')">← رجوع</button>'
+  + '</div>'
+  + '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px;">'
+    + '<div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">إجمالي الفواتير</div><div style="font-size:18px;font-weight:800;color:#60a5fa;margin-top:6px;">'+total_invoices.toLocaleString()+' ر.س</div></div>'
+    + '<div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">إجمالي المدفوع</div><div style="font-size:18px;font-weight:800;color:#52b788;margin-top:6px;">'+total_paid.toLocaleString()+' ر.س</div></div>'
+    + '<div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">المتبقي</div><div style="font-size:18px;font-weight:800;color:'+(total_remaining>0?'#f87171':'#52b788')+';margin-top:6px;">'+total_remaining.toLocaleString()+' ر.س</div></div>'
+  + '</div>'
+  + '<div class="card"><table>'
+    + '<thead><tr><th>#</th><th>التاريخ</th><th>الإجمالي</th><th>المدفوع</th><th>المتبقي</th><th>الحالة</th><th></th></tr></thead>'
+    + '<tbody>'
+    + invoices.map(inv=>'<tr>'
+        + '<td style="color:#64748b;">#'+inv.id+'</td>'
+        + '<td>'+inv.date+'</td>'
+        + '<td style="font-weight:700;">'+Math.abs(inv.total||0).toLocaleString()+' ر.س</td>'
+        + '<td style="color:#52b788;font-weight:600;">'+(inv.paid||0).toLocaleString()+' ر.س</td>'
+        + '<td style="color:'+(inv.remaining>0?'#f87171':'#52b788')+';font-weight:700;">'+(inv.remaining||0).toLocaleString()+' ر.س</td>'
+        + '<td><span class="badge '+(inv.status==='مدفوع'?'g':inv.status==='معلق'?'r':'b')+'">'+inv.status+'</span></td>'
+        + '<td><div style="display:flex;gap:4px;">'
+          + (inv.remaining>0?'<button class="btn p" style="padding:3px 8px;font-size:11px;background:linear-gradient(135deg,#1e40af,#1e3a8a);" onclick="openPay('+inv.id+',''+ref_type+'')">💳 دفعة</button>':'')
+          + '<button class="btn s" style="padding:3px 8px;font-size:11px;" onclick="viewPayHist('+inv.id+',''+ref_type+'')">📊</button>'
+        + '</div></td>'
+      + '</tr>').join('')
+    + '</tbody></table></div>'
+  + '</div>';
 }
 
 // REPORTS
@@ -1142,12 +1392,19 @@ function reportsHTML(){
 
 function repContent(type){
   if(type==='sales') return `<div class="card"><table>
-    <thead><tr><th>#</th><th>التاريخ</th><th>الزبون</th><th>الاجمالي</th><th>الحالة</th><th>الدفع</th></tr></thead>
-    <tbody>${sales.map(s=>`<tr><td style="color:#64748b;">#${s.id}</td><td style="font-weight:600;">${s.date}</td>
+    <thead><tr><th>#</th><th>التاريخ</th><th>الزبون</th><th>الاجمالي</th><th>الحالة</th><th>الدفع</th><th>إجراءات</th></tr></thead>
+    <tbody>${sales.map(s=>`<tr>
+    <td style="color:#64748b;">#${s.id}</td>
+    <td style="font-weight:600;">${s.date}</td>
     <td style="color:#52b788;font-weight:600;">${customers.find(c=>c.id===s.customer_id)?.name||'زبون عام'}</td>
     <td style="font-weight:700;">${(s.total||0).toLocaleString()} ر.س</td>
     <td><span class="badge ${s.status==='مدفوع'?'g':'y'}">${s.status}</span></td>
-    <td>${s.pay_method}</td></tr>`).join('')||'<tr><td colspan="6" style="text-align:center;color:#475569;padding:20px;">لا توجد مبيعات</td></tr>'}
+    <td>${s.pay_method}</td>
+    <td><div style="display:flex;gap:4px;">
+      ${s.status!=='مدفوع'?`<button class="btn p" style="padding:3px 8px;font-size:11px;background:linear-gradient(135deg,#1e40af,#1e3a8a);" onclick="openPay(${s.id},'sale')">💳 دفعة</button>`:''}
+      <button class="btn s" style="padding:3px 8px;font-size:11px;" onclick="viewPayHist(${s.id},'sale')">📊 الدفعات</button>
+    </div></td>
+    </tr>`).join('')||'<tr><td colspan="7" style="text-align:center;color:#475569;padding:20px;">لا توجد مبيعات</td></tr>'}
     </tbody></table></div>`;
 
   if(type==='purchases') return `<div class="card"><table>
@@ -1344,9 +1601,104 @@ function modalHTML(){
   if(MS.type==='purform')  return purModal();
   if(MS.type==='editpur')  return editPurModal(MS.data||{});
   if(MS.type==='retpur')   return returnPurModal(MS.data||{});
+  if(MS?.type==='payform')  return payModal(MS.data||{});
+  if(MS?.type==='payhist')  return payHistModal(MS.data||{});
   if(MS.type==='done')     return doneModal(MS.data);
   return '';
 }
+
+// ── مودال إضافة دفعة ──
+function payModal(d){
+  const today = new Date().toISOString().slice(0,10);
+  const paidSoFar = d.paid || 0;
+  const remaining = Math.max(0, Math.abs(d.total||0) - paidSoFar);
+  return '<div class="overlay" id="mover"><div class="modal" style="max-width:520px;">'
+  + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;">'
+    + '<div><div style="font-size:16px;font-weight:700;color:#f1f5f9;">💳 إضافة دفعة</div>'
+    + '<div style="font-size:12px;color:#64748b;margin-top:2px;">'+(d.ref_type==='purchase'?'فاتورة شراء':'فاتورة بيع')+' #'+d.ref_id+' — '+(d.party_name||'')+'</div></div>'
+    + '<button class="btn s" style="padding:4px 9px;" id="mc">✕</button>'
+  + '</div>'
+  + '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px;">'
+    + '<div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">إجمالي الفاتورة</div><div style="font-size:15px;font-weight:800;color:#f1f5f9;margin-top:4px;">'+Math.abs(d.total||0).toLocaleString()+' ر.س</div></div>'
+    + '<div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">المدفوع</div><div style="font-size:15px;font-weight:800;color:#52b788;margin-top:4px;">'+paidSoFar.toLocaleString()+' ر.س</div></div>'
+    + '<div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">المتبقي</div><div style="font-size:15px;font-weight:800;color:'+(remaining>0?'#f87171':'#52b788')+';margin-top:4px;">'+remaining.toLocaleString()+' ر.س</div></div>'
+  + '</div>'
+  + '<div id="merr"></div>'
+  + '<div class="g2" style="margin-bottom:12px;">'
+    + '<div><label class="lbl">طريقة الدفع <span style="color:#f87171;">*</span></label>'
+      + '<select class="inp" id="pay-method" onchange="toggleCheque(this.value)">'
+        + '<option value="نقدي">💵 نقدي</option>'
+        + '<option value="شيك">🏦 شيك</option>'
+        + '<option value="تحويل بنكي">🔄 تحويل بنكي</option>'
+        + '<option value="بطاقة">💳 بطاقة</option>'
+      + '</select></div>'
+    + '<div><label class="lbl">المبلغ <span style="color:#f87171;">*</span></label>'
+      + '<input class="inp" type="number" id="pay-amount" value="'+remaining+'" min="0.01" step="0.01"/></div>'
+    + '<div><label class="lbl">التاريخ <span style="color:#f87171;">*</span></label>'
+      + '<input class="inp" type="date" id="pay-date" value="'+today+'"/></div>'
+    + '<div><label class="lbl">ملاحظات</label>'
+      + '<input class="inp" id="pay-notes" placeholder="ملاحظات اختيارية..."/></div>'
+  + '</div>'
+  + '<div id="cheque-fields" style="display:none;background:#1a1d27;border-radius:8px;padding:14px;margin-bottom:14px;">'
+    + '<div style="font-size:13px;font-weight:700;color:#60a5fa;margin-bottom:10px;">🏦 بيانات الشيك</div>'
+    + '<div class="g2">'
+      + '<div><label class="lbl">رقم الشيك</label><input class="inp" id="pay-cheque-no" placeholder="رقم الشيك..."/></div>'
+      + '<div><label class="lbl">تاريخ الشيك</label><input class="inp" type="date" id="pay-cheque-date" value="'+today+'"/></div>'
+      + '<div style="grid-column:span 2"><label class="lbl">اسم البنك</label><input class="inp" id="pay-cheque-bank" placeholder="اسم البنك..."/></div>'
+    + '</div>'
+  + '</div>'
+  + '<div style="display:flex;gap:10px;">'
+    + '<button class="btn p" id="ms" style="flex:1;justify-content:center;">💾 حفظ الدفعة</button>'
+    + '<button class="btn s" id="mc2">إلغاء</button>'
+  + '</div></div></div>';
+}
+
+// ── مودال سجل الدفعات ──
+function payHistModal(d){
+  const payments = d.payments || [];
+  const paidTotal = payments.reduce((s,p)=>s+p.amount,0);
+  const remaining = Math.max(0, Math.abs(d.total||0) - paidTotal);
+  const rows = payments.map(p=>'<tr>'
+    + '<td style="font-weight:600;">'+p.date+'</td>'
+    + '<td><span class="badge '+(p.method==='نقدي'?'g':p.method==='شيك'?'b':'y')+'">'+p.method+'</span></td>'
+    + '<td style="font-weight:800;color:#52b788;">'+p.amount.toLocaleString()+' ر.س</td>'
+    + '<td style="font-size:12px;color:#64748b;">'+(p.cheque_no?'#'+p.cheque_no+' '+p.cheque_bank:'')+'</td>'
+    + '<td style="font-size:12px;color:#94a3b8;">'+(p.notes||'')+'</td>'
+    + '<td><button class="btn d" style="padding:3px 7px;" onclick="deletePay('+p.id+')">🗑️</button></td>'
+  + '</tr>').join('');
+  return '<div class="overlay" id="mover"><div class="modal" style="max-width:640px;">'
+  + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">'
+    + '<div><div style="font-size:16px;font-weight:700;color:#f1f5f9;">📋 سجل الدفعات</div>'
+    + '<div style="font-size:12px;color:#64748b;margin-top:2px;">'+(d.ref_type==='purchase'?'فاتورة شراء':'فاتورة بيع')+' #'+d.ref_id+' — '+(d.party_name||'')+'</div></div>'
+    + '<button class="btn s" style="padding:4px 9px;" id="mc">✕</button>'
+  + '</div>'
+  + '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px;">'
+    + '<div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">إجمالي الفاتورة</div><div style="font-size:15px;font-weight:800;color:#f1f5f9;margin-top:4px;">'+Math.abs(d.total||0).toLocaleString()+' ر.س</div></div>'
+    + '<div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">إجمالي المدفوع</div><div style="font-size:15px;font-weight:800;color:#52b788;margin-top:4px;">'+paidTotal.toLocaleString()+' ر.س</div></div>'
+    + '<div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">المتبقي</div><div style="font-size:15px;font-weight:800;color:'+(remaining>0?'#f87171':'#52b788')+';margin-top:4px;">'+remaining.toLocaleString()+' ر.س</div></div>'
+  + '</div>'
+  + (payments.length
+    ? '<div class="card" style="margin-bottom:14px;"><table><thead><tr><th>التاريخ</th><th>الطريقة</th><th>المبلغ</th><th>الشيك</th><th>ملاحظات</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+    : '<div style="text-align:center;color:#64748b;padding:20px;">لا توجد دفعات مسجلة</div>')
+  + '<div style="display:flex;gap:10px;">'
+    + '<button class="btn p" onclick="addPayFromHist()" style="flex:1;justify-content:center;">+ إضافة دفعة جديدة</button>'
+    + '<button class="btn s" id="mc2">إغلاق</button>'
+  + '</div></div></div>';
+}
+
+window.toggleCheque = function(val){
+  const el=document.getElementById('cheque-fields');
+  if(el) el.style.display=val==='شيك'?'block':'none';
+};
+window.deletePay = async function(id){
+  if(!confirm('حذف هذه الدفعة؟')) return;
+  try{ await api('DELETE','/api/payments/'+id); await loadAll(); closeM(); }
+  catch(e){ alert('خطأ: '+e.message); }
+};
+window.addPayFromHist = function(){
+  const d=MS?.data; if(!d) return;
+  MS={type:'payform',data:d}; render();
+};
 
 function prodModal(item){
   const sups=suppliers.map(s=>`<option value="${s.id}"${item.supplier_id===s.id?' selected':''}>${s.name}</option>`).join('');
@@ -1823,6 +2175,52 @@ function bindModal(){
     document.getElementById('puq')?.addEventListener('keydown',e=>e.key==='Enter'&&addItemE());
   }
 
+  // ── دفعة جديدة ──
+  if(MS?.type==='payform'){
+    document.getElementById('ms').onclick = async()=>{
+      const method  = document.getElementById('pay-method')?.value||'نقدي';
+      const amount  = parseFloat(document.getElementById('pay-amount')?.value||0);
+      const date    = document.getElementById('pay-date')?.value||'';
+      const notes   = document.getElementById('pay-notes')?.value||'';
+      const cheqNo  = document.getElementById('pay-cheque-no')?.value||'';
+      const cheqDt  = document.getElementById('pay-cheque-date')?.value||'';
+      const cheqBnk = document.getElementById('pay-cheque-bank')?.value||'';
+      const d       = MS.data||{};
+      const errEl   = document.getElementById('merr');
+
+      if(!amount||amount<=0){
+        if(errEl) errEl.innerHTML='<div class="err">⚠️ أدخل مبلغاً أكبر من صفر</div>';
+        return;
+      }
+      if(!date){
+        if(errEl) errEl.innerHTML='<div class="err">⚠️ حدد تاريخ الدفعة</div>';
+        return;
+      }
+      if(method==='شيك'&&!cheqNo){
+        if(errEl) errEl.innerHTML='<div class="err">⚠️ أدخل رقم الشيك</div>';
+        return;
+      }
+
+      try{
+        await api('POST','/api/payments',{
+          ref_type:   d.ref_type,
+          ref_id:     d.ref_id,
+          party_type: d.party_type,
+          party_id:   d.party_id,
+          amount, method, date, notes,
+          cheque_no:   cheqNo,
+          cheque_date: cheqDt,
+          cheque_bank: cheqBnk
+        });
+        await loadAll();
+        closeM();
+        alert('✅ تم حفظ الدفعة بنجاح');
+      }catch(e){
+        if(errEl) errEl.innerHTML='<div class="err">خطأ: '+e.message+'</div>';
+      }
+    };
+  }
+
   // ── مردود مشتريات ──
   if(MS?.type==='retpur'){
     document.getElementById('ms').onclick=async()=>{
@@ -1846,6 +2244,64 @@ function bindModal(){
     };
   }
 }
+
+// ── فتح مودال إضافة دفعة ──
+window.openPay = async function(ref_id, ref_type){
+  // جلب الدفعات المسبقة لحساب المتبقي
+  const inv = ref_type==='purchase'
+    ? purchases.find(p=>p.id===ref_id)
+    : sales.find(s=>s.id===ref_id);
+  if(!inv){ alert('الفاتورة غير موجودة'); return; }
+
+  let paidSoFar = 0;
+  try{
+    const pays = await api('GET', '/api/payments?ref_type='+ref_type+'&ref_id='+ref_id);
+    paidSoFar = pays.reduce((s,p)=>s+p.amount, 0);
+  }catch(e){}
+
+  const party_id   = ref_type==='purchase' ? inv.supplier_id : inv.customer_id;
+  const party_type = ref_type==='purchase' ? 'supplier' : 'customer';
+  const party_name = ref_type==='purchase'
+    ? suppliers.find(s=>s.id===parseInt(party_id))?.name||'—'
+    : customers.find(c=>c.id===parseInt(party_id))?.name||'—';
+
+  MS = {type:'payform', data:{
+    ref_type, ref_id,
+    party_type, party_id,
+    party_name,
+    total: inv.total,
+    paid: paidSoFar
+  }};
+  render();
+};
+
+// ── عرض سجل الدفعات ──
+window.viewPayHist = async function(ref_id, ref_type){
+  const inv = ref_type==='purchase'
+    ? purchases.find(p=>p.id===ref_id)
+    : sales.find(s=>s.id===ref_id);
+  if(!inv){ alert('الفاتورة غير موجودة'); return; }
+
+  const party_id   = ref_type==='purchase' ? inv.supplier_id : inv.customer_id;
+  const party_name = ref_type==='purchase'
+    ? suppliers.find(s=>s.id===parseInt(party_id))?.name||'—'
+    : customers.find(c=>c.id===parseInt(party_id))?.name||'—';
+
+  let payments = [];
+  try{
+    payments = await api('GET', '/api/payments?ref_type='+ref_type+'&ref_id='+ref_id);
+  }catch(e){}
+
+  MS = {type:'payhist', data:{
+    ref_type, ref_id,
+    party_name,
+    total: inv.total,
+    payments,
+    party_type: ref_type==='purchase'?'supplier':'customer',
+    party_id
+  }};
+  render();
+};
 
 window.updCart=function(pid,f,v){const i=cart.find(x=>x.product_id===pid);if(i)i[f]=+v;};
 window.remCart=function(pid){cart=cart.filter(x=>x.product_id!==pid);MS={type:'purform'};render();bindModal();};
