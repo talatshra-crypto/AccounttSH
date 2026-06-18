@@ -726,6 +726,22 @@ tr:hover td{background:#1a1d27}
 const API='';
 let TOKEN=localStorage.getItem('token'), USER=null;
 
+// معالج الأخطاء العام - يمنع توقف الصفحة
+window.onerror = function(msg, src, line, col, err){
+  console.error('JS Error:', msg, 'line:', line);
+  const el = document.getElementById('app');
+  if(el && !TOKEN){
+    el.innerHTML = '<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;">'
+    + '<div style="width:360px;padding:36px;background:#161923;border-radius:18px;border:1px solid #1e2537;text-align:center;">'
+    + '<div style="font-size:48px;margin-bottom:16px;">⚠️</div>'
+    + '<div style="font-size:18px;font-weight:700;color:#f87171;margin-bottom:8px;">خطأ في التحميل</div>'
+    + '<div style="color:#64748b;font-size:13px;margin-bottom:20px;">' + msg + '</div>'
+    + '<button onclick="location.reload()" style="background:linear-gradient(135deg,#2d6a4f,#1b4332);color:#fff;border:none;padding:10px 24px;border-radius:8px;cursor:pointer;font-size:15px;">🔄 إعادة المحاولة</button>'
+    + '</div></div>';
+  }
+  return false;
+};
+
 async function api(method,path,body){
   const h={'Content-Type':'application/json'};
   if(TOKEN) h['Authorization']='Bearer '+TOKEN;
@@ -739,25 +755,36 @@ async function api(method,path,body){
 }
 
 let page='dashboard', sideOpen=true;
-let products=[], suppliers=[], customers=[], purchases=[], sales=[], stats=null, loading=false, purchaseReturns=[];
+let products=[], suppliers=[], customers=[], purchases=[], sales=[], stats=null, loading=false;
 
 async function loadAll(){
   loading=true; render();
   try{
-    const [p,s,cu,pu,sl,st,pr] = await Promise.all([
+    const [p,s,cu,pu,sl,st] = await Promise.all([
       api('GET','/api/products'), api('GET','/api/suppliers'), api('GET','/api/customers'),
-      api('GET','/api/purchases'), api('GET','/api/sales'), api('GET','/api/dashboard'),
-      api('GET','/api/purchase_returns').catch(()=>[])
+      api('GET','/api/purchases'), api('GET','/api/sales'), api('GET','/api/dashboard')
     ]);
-    products=p; suppliers=s; customers=cu; purchases=pu; sales=sl; stats=st; purchaseReturns=pr;
+    products=p; suppliers=s; customers=cu; purchases=pu; sales=sl; stats=st;
   }catch(e){console.error(e);}
   loading=false; render();
 }
 
 function render(){
-  const el=document.getElementById('app');
-  if(!TOKEN){el.innerHTML=loginHTML(); bindLogin(); return;}
-  el.innerHTML=appHTML(); bindApp();
+  try{
+    const el=document.getElementById('app');
+    if(!el) return;
+    if(!TOKEN){el.innerHTML=loginHTML(); bindLogin(); return;}
+    el.innerHTML=appHTML(); bindApp();
+  }catch(err){
+    console.error('Render error:', err);
+    const el=document.getElementById('app');
+    if(el) el.innerHTML='<div style="padding:40px;text-align:center;color:#f87171;">'
+      +'<div style="font-size:48px;margin-bottom:16px;">⚠️</div>'
+      +'<div style="font-size:18px;font-weight:700;margin-bottom:8px;">خطأ في التحميل</div>'
+      +'<div style="color:#64748b;margin-bottom:20px;">'+err.message+'</div>'
+      +'<button class="btn p" onclick="location.reload()">🔄 إعادة التحميل</button>'
+      +'</div>';
+  }
 }
 
 // ── LOGIN ──────────────────────────────────────
@@ -1143,7 +1170,7 @@ function accountingHTML(){
   const tp = purchases.reduce((s,x)=>s+x.total, 0);
 
   // حساب إجمالي مشتريات كل مورد من الفواتير الفعلية
-  const supStats = suppliers.map(s=>{
+  supStats = suppliers.map(s=>{
     const purList = purchases.filter(p=> parseInt(p.supplier_id)===s.id);
     const total   = purList.reduce((t,p)=>t+p.total, 0);
     const paid    = purList.filter(p=>p.status==='مدفوع').reduce((t,p)=>t+p.total, 0);
@@ -1152,7 +1179,7 @@ function accountingHTML(){
   });
 
   // حساب إجمالي مبيعات كل زبون من الفواتير الفعلية
-  const custStats = customers.map(c=>{
+  custStats = customers.map(c=>{
     const saleList = sales.filter(s=> parseInt(s.customer_id)===c.id);
     const total    = saleList.reduce((t,s)=>t+s.total, 0);
     const paid     = saleList.filter(s=>s.status==='مدفوع').reduce((t,s)=>t+s.total, 0);
@@ -1243,6 +1270,22 @@ window.accTab = async function(tab){
   });
   const el = document.getElementById('acc-content');
   if(!el) return;
+
+  // إعادة حساب الإحصاءات دائماً
+  supStats = suppliers.map(s=>{
+    const purList = purchases.filter(p=>parseInt(p.supplier_id)===s.id);
+    const total   = purList.reduce((t,p)=>t+p.total,0);
+    const paid    = purList.filter(p=>p.status==='مدفوع').reduce((t,p)=>t+p.total,0);
+    const pending = purList.filter(p=>p.status!=='مدفوع').reduce((t,p)=>t+p.total,0);
+    return {...s, purTotal:total, purPaid:paid, purPending:pending, purCount:purList.length};
+  });
+  custStats = customers.map(c=>{
+    const saleList = sales.filter(s=>parseInt(s.customer_id)===c.id);
+    const total    = saleList.reduce((t,s)=>t+s.total,0);
+    const paid     = saleList.filter(s=>s.status==='مدفوع').reduce((t,s)=>t+s.total,0);
+    const pending  = saleList.filter(s=>s.status!=='مدفوع').reduce((t,s)=>t+s.total,0);
+    return {...c, saleTotal:total, salePaid:paid, salePending:pending, saleCount:saleList.length};
+  });
 
   if(tab==='sum'){
     el.innerHTML = document.getElementById('acc-sum-content')?.innerHTML || '';
@@ -2666,6 +2709,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type","text/html; charset=utf-8")
             self.send_header("Content-Length", len(body))
+            self.send_header("Cache-Control","no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma","no-cache")
+            self.send_header("Expires","0")
             self.end_headers()
             self.wfile.write(body)
         elif path.startswith("/api/"):
@@ -2722,6 +2768,8 @@ if __name__ == "__main__":
     # Railway deployment
     server = HTTPServer(("0.0.0.0", PORT), Handler)
     print(f"✅ Server running on port {PORT}")
+    print(f"📁 Database: {DB_PATH}")
+    print(f"⚠️  Note: On Railway, data resets on each deploy unless using a volume")
     
     def shutdown(sig, frame):
         print("\n⛔ Shutting down...")
