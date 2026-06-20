@@ -1409,8 +1409,8 @@ function paySummaryHTML(data, name, party_type){
         + '<td style="color:'+(inv.remaining>0?'#f87171':'#52b788')+';font-weight:700;">'+(inv.remaining||0).toLocaleString()+' ر.س</td>'
         + '<td><span class="badge '+(inv.status==='مدفوع'?'g':inv.status==='معلق'?'r':'b')+'">'+inv.status+'</span></td>'
         + '<td><div style="display:flex;gap:4px;">'
-          + (inv.remaining>0?'<button class="btn p" style="padding:3px 8px;font-size:11px;background:linear-gradient(135deg,#1e40af,#1e3a8a);" onclick="openPay('+inv.id+',''+ref_type+'')">💳 دفعة</button>':'')
-          + '<button class="btn s" style="padding:3px 8px;font-size:11px;" onclick="viewPayHist('+inv.id+',''+ref_type+'')">📊</button>'
+          + (inv.remaining>0?('<button class="btn p" style="padding:3px 8px;font-size:11px;background:linear-gradient(135deg,#1e40af,#1e3a8a);" onclick="openPay('+inv.id+',&quot;'+ref_type+'&quot;)">💳 دفعة</button>'):'')
+          + '<button class="btn s" style="padding:3px 8px;font-size:11px;" onclick="viewPayHist('+inv.id+',&quot;'+ref_type+'&quot;)">📊</button>'
         + '</div></td>'
       + '</tr>').join('')
     + '</tbody></table></div>'
