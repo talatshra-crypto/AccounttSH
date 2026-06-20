@@ -1391,7 +1391,7 @@ function paySummaryHTML(data, name, party_type){
   return '<div>'
   + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">'
     + '<div style="font-size:16px;font-weight:800;color:#f1f5f9;">كشف حساب: '+name+'</div>'
-    + '<button class="btn s" style="font-size:12px;" onclick="accTab('sum')">← رجوع</button>'
+    + '<button class="btn s" style="font-size:12px;" onclick="accTab(&quot;sum&quot;)">← رجوع</button>'
   + '</div>'
   + '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px;">'
     + '<div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">إجمالي الفواتير</div><div style="font-size:18px;font-weight:800;color:#60a5fa;margin-top:6px;">'+total_invoices.toLocaleString()+' ر.س</div></div>'
