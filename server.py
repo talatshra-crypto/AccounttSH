@@ -691,6 +691,10 @@ class PaymentsDAO(BaseDAO):
             "SELECT * FROM payments WHERE party_type=? AND party_id=? ORDER BY date DESC",
             (party_type, int(party_id))))
     @staticmethod
+    def get_all_by_ref_type(c, ref_type):
+        return BaseDAO.rows(c.execute(
+            "SELECT * FROM payments WHERE ref_type=? ORDER BY date DESC", (ref_type,)))
+    @staticmethod
     def list_recent(c, limit=100):
         return BaseDAO.rows(c.execute("SELECT * FROM payments ORDER BY id DESC LIMIT ?", (limit,)))
     @staticmethod
@@ -2042,6 +2046,8 @@ def handle_api(method, path, body, req):
                 ps = PaymentsDAO.get_by_ref(c, ref_type, ref_id)
             elif party_type and party_id:
                 ps = PaymentsDAO.get_by_party(c, party_type, party_id)
+            elif ref_type == "account":
+                ps = PaymentsDAO.get_all_by_ref_type(c, "account")
             else:
                 ps = PaymentsDAO.list_recent(c)
             c.close(); return 200, ps
@@ -2211,11 +2217,13 @@ let page='dashboard', sideOpen=true;
 let MS = null;          // حالة النافذة المنبثقة الحالية (Modal State)
 let cart = [];          // سلة فاتورة الشراء الجارية
 let supStats = [], custStats = [];   // إحصاءات صفحة الحسابات
+let _accView = {tab:'sum'};          // تتبع الشاشة الحالية بصفحة الحسابات (تبويب أو كشف حساب مفتوح) لاستعادتها بعد أي عملية
 let _purDraftStash = null;           // حفظ مؤقت لحالة فاتورة الشراء عند فتح نموذج منتج جديد من داخلها
 let _pendingPurDraftFields = null;   // حفظ حقول المورد/التاريخ/الحالة مؤقتاً
 let _pendingSelectProductId = null;  // تحديد المنتج الذي أُنشئ للتو ليُختار تلقائياً
 let products=[], suppliers=[], customers=[], purchases=[], sales=[], stats=null, loading=false;
 let expenseCategories=[], expenses=[], employees=[], payrollRecords=[], recurringExpenses=[];
+let accountPayments=[]; // كل الدفعات "على الحساب" (غير مرتبطة بفاتورة محددة) لكل الموردين والزبائن
 let serviceOrders=[];
 let sysUsers=[], sysSettings={currency:'₪', currency_name:'شيكل', system_name:'نظام ادارة المخازن', low_stock_threshold:'20', vip_customer_threshold:'5000', overdue_days_threshold:'30', supplier_payable_alert_threshold:'5000'};
 
@@ -2283,10 +2291,31 @@ function getOverdueCustomers(){
     .filter(x=>x.info);
 }
 
-// إجمالي المستحق (غير المسدد) لمورد معيّن من جميع فواتير الشراء غير المردودة
+// إجمالي الدفعات "على الحساب" (غير المرتبطة بفاتورة محددة) لمورد معيّن
+function supplierAccountPaid(supId){
+  return accountPayments.filter(p=>p.party_type==='supplier' && parseInt(p.party_id)===parseInt(supId))
+    .reduce((t,p)=>t+(p.amount||0), 0);
+}
+// إجمالي الدفعات "على الحساب" لزبون معيّن
+function customerAccountPaid(custId){
+  return accountPayments.filter(p=>p.party_type==='customer' && parseInt(p.party_id)===parseInt(custId))
+    .reduce((t,p)=>t+(p.amount||0), 0);
+}
+
+// إجمالي المستحق (غير المسدد) لمورد معيّن من جميع فواتير الشراء غير المردودة، مطروحاً منه دفعات الحساب المباشرة
 function supplierPayable(supId){
   const purs = purchases.filter(p=>parseInt(p.supplier_id)===parseInt(supId) && p.status!=='مردود');
-  return purs.reduce((t,p)=>t + Math.max(0, (p.total||0)-(p.paid||0)), 0);
+  const invoicesDue = purs.reduce((t,p)=>t + Math.max(0, (p.total||0)-(p.paid||0)), 0);
+  return Math.max(0, invoicesDue - supplierAccountPaid(supId));
+}
+
+// إجمالي المستحق على زبون معيّن من كل مبيعاته وطلبات خدماته، مطروحاً منه دفعات الحساب المباشرة
+function customerReceivable(custId){
+  const custSales = sales.filter(s=>parseInt(s.customer_id)===parseInt(custId));
+  const custServices = serviceOrders.filter(o=>parseInt(o.customer_id)===parseInt(custId));
+  const invoicesDue = custSales.reduce((t,s)=>t + Math.max(0,(s.total||0)-(s.paid||0)), 0)
+                    + custServices.reduce((t,o)=>t + Math.max(0,(o.service_fee||0)-(o.paid||0)), 0);
+  return Math.max(0, invoicesDue - customerAccountPaid(custId));
 }
 
 // الموردون الذين تجاوزت مستحقاتهم حد التنبيه المحدد بالإعدادات
@@ -2329,17 +2358,17 @@ function expiryBadge(p){
 async function loadAll(){
   loading=true; render();
   try{
-    const [p,s,cu,pu,sl,st,pays,cfg,expCats,exps,emps,payr,recExp,svcOrd] = await Promise.all([
+    const [p,s,cu,pu,sl,st,pays,cfg,expCats,exps,emps,payr,recExp,svcOrd,acctPays] = await Promise.all([
       api('GET','/api/products'), api('GET','/api/suppliers'), api('GET','/api/customers'),
       api('GET','/api/purchases'), api('GET','/api/sales'), api('GET','/api/dashboard'),
       api('GET','/api/payments'), api('GET','/api/settings'),
       api('GET','/api/expense_categories'), api('GET','/api/expenses'),
       api('GET','/api/employees'), api('GET','/api/payroll'), api('GET','/api/recurring_expenses'),
-      api('GET','/api/service_orders')
+      api('GET','/api/service_orders'), api('GET','/api/payments?ref_type=account')
     ]);
     products=p; suppliers=s; customers=cu; purchases=pu; sales=sl; stats=st;
     expenseCategories=expCats; expenses=exps; employees=emps; payrollRecords=payr; recurringExpenses=recExp;
-    serviceOrders=svcOrd;
+    serviceOrders=svcOrd; accountPayments=acctPays;
     sysSettings = {...sysSettings, ...cfg};
     // جلب المستخدمين إن كان أدمن
     if(USER?.role==='admin'){
@@ -3064,25 +3093,28 @@ function renderEntity(type,q=''){
 
 // ACCOUNTING
 function accountingHTML(){
-  const ts = sales.reduce((s,x)=>s+x.total, 0);
+  const ts = sales.reduce((s,x)=>s+x.total, 0) + serviceOrders.reduce((s,x)=>s+(x.service_fee||0), 0);
   const tp = purchases.reduce((s,x)=>s+x.total, 0);
 
-  // حساب إجمالي مشتريات كل مورد من الفواتير الفعلية
+  // حساب إجمالي مشتريات كل مورد من الفواتير الفعلية (بالمبالغ الحقيقية، مع خصم دفعات الحساب المباشرة)
   supStats = suppliers.map(s=>{
-    const purList = purchases.filter(p=> parseInt(p.supplier_id)===s.id);
+    const purList = purchases.filter(p=> parseInt(p.supplier_id)===s.id && p.status!=='مردود');
     const total   = purList.reduce((t,p)=>t+p.total, 0);
-    const paid    = purList.filter(p=>p.status==='مدفوع').reduce((t,p)=>t+p.total, 0);
-    const pending = purList.filter(p=>p.status!=='مدفوع').reduce((t,p)=>t+p.total, 0);
-    return {...s, purTotal:total, purPaid:paid, purPending:pending, purCount:purList.length};
+    const accPaid = supplierAccountPaid(s.id);
+    const paid    = purList.reduce((t,p)=>t+(p.paid||0), 0) + accPaid;
+    const pending = supplierPayable(s.id);
+    return {...s, purTotal:total, purPaid:paid, purPending:pending, purCount:purList.length, accPaid};
   });
 
-  // حساب إجمالي مبيعات كل زبون من الفواتير الفعلية
+  // حساب إجمالي مبيعات وخدمات كل زبون من الفواتير الفعلية (مع خصم دفعات الحساب المباشرة)
   custStats = customers.map(c=>{
     const saleList = sales.filter(s=> parseInt(s.customer_id)===c.id);
-    const total    = saleList.reduce((t,s)=>t+s.total, 0);
-    const paid     = saleList.filter(s=>s.status==='مدفوع').reduce((t,s)=>t+s.total, 0);
-    const pending  = saleList.filter(s=>s.status!=='مدفوع').reduce((t,s)=>t+s.total, 0);
-    return {...c, saleTotal:total, salePaid:paid, salePending:pending, saleCount:saleList.length};
+    const svcList  = serviceOrders.filter(o=> parseInt(o.customer_id)===c.id);
+    const total    = saleList.reduce((t,s)=>t+s.total, 0) + svcList.reduce((t,o)=>t+(o.service_fee||0), 0);
+    const accPaid  = customerAccountPaid(c.id);
+    const paid     = saleList.reduce((t,s)=>t+(s.paid||0), 0) + svcList.reduce((t,o)=>t+(o.paid||0), 0) + accPaid;
+    const pending  = customerReceivable(c.id);
+    return {...c, saleTotal:total, salePaid:paid, salePending:pending, saleCount:saleList.length+svcList.length, accPaid};
   });
 
   const totalPending = supStats.reduce((s,x)=>s+x.purPending, 0);
@@ -3612,6 +3644,7 @@ function serviceDetailModal(o){
 }
 
 window.accTab = async function(tab){
+  _accView = {tab};
   document.querySelectorAll('[id^="acc-tab-"]').forEach(b=>{
     b.className = b.id==='acc-tab-'+tab ? 'btn p' : 'btn s';
   });
@@ -3620,18 +3653,21 @@ window.accTab = async function(tab){
 
   // إعادة حساب الإحصاءات دائماً
   supStats = suppliers.map(s=>{
-    const purList = purchases.filter(p=>parseInt(p.supplier_id)===s.id);
+    const purList = purchases.filter(p=>parseInt(p.supplier_id)===s.id && p.status!=='مردود');
     const total   = purList.reduce((t,p)=>t+p.total,0);
-    const paid    = purList.filter(p=>p.status==='مدفوع').reduce((t,p)=>t+p.total,0);
-    const pending = purList.filter(p=>p.status!=='مدفوع').reduce((t,p)=>t+p.total,0);
-    return {...s, purTotal:total, purPaid:paid, purPending:pending, purCount:purList.length};
+    const accPaid = supplierAccountPaid(s.id);
+    const paid    = purList.reduce((t,p)=>t+(p.paid||0),0) + accPaid;
+    const pending = supplierPayable(s.id);
+    return {...s, purTotal:total, purPaid:paid, purPending:pending, purCount:purList.length, accPaid};
   });
   custStats = customers.map(c=>{
     const saleList = sales.filter(s=>parseInt(s.customer_id)===c.id);
-    const total    = saleList.reduce((t,s)=>t+s.total,0);
-    const paid     = saleList.filter(s=>s.status==='مدفوع').reduce((t,s)=>t+s.total,0);
-    const pending  = saleList.filter(s=>s.status!=='مدفوع').reduce((t,s)=>t+s.total,0);
-    return {...c, saleTotal:total, salePaid:paid, salePending:pending, saleCount:saleList.length};
+    const svcList  = serviceOrders.filter(o=>parseInt(o.customer_id)===c.id);
+    const total    = saleList.reduce((t,s)=>t+s.total,0) + svcList.reduce((t,o)=>t+(o.service_fee||0),0);
+    const accPaid  = customerAccountPaid(c.id);
+    const paid     = saleList.reduce((t,s)=>t+(s.paid||0),0) + svcList.reduce((t,o)=>t+(o.paid||0),0) + accPaid;
+    const pending  = customerReceivable(c.id);
+    return {...c, saleTotal:total, salePaid:paid, salePending:pending, saleCount:saleList.length+svcList.length, accPaid};
   });
 
   if(tab==='sum'){
@@ -3686,7 +3722,7 @@ window.accTab = async function(tab){
       <div style="display:flex;gap:10px;flex-wrap:wrap;">
         <span class="badge b">${s.purCount} فاتورة</span>
         <span style="color:#60a5fa;font-weight:700;">${s.purTotal.toLocaleString()} ${cur()} إجمالي</span>
-        ${s.purPaid>0?`<span class="badge g">مدفوع: ${s.purPaid.toLocaleString()} ${cur()}</span>`:''}
+        ${s.purPaid>0?`<span class="badge g">مدفوع: ${s.purPaid.toLocaleString()} ${cur()}${s.accPaid>0?` (منها ${s.accPaid.toLocaleString()} على الحساب)`:''}</span>`:''}
         ${s.purPending>0?`<span class="badge r">معلق: ${s.purPending.toLocaleString()} ${cur()}</span>`:''}
       </div>
     </div>`).join('');
@@ -3709,7 +3745,7 @@ window.accTab = async function(tab){
       <div style="display:flex;gap:10px;flex-wrap:wrap;">
         <span class="badge b">${c.saleCount} فاتورة</span>
         <span style="color:#52b788;font-weight:700;">${c.saleTotal.toLocaleString()} ${cur()} إجمالي</span>
-        ${c.salePaid>0?`<span class="badge g">مدفوع: ${c.salePaid.toLocaleString()} ${cur()}</span>`:''}
+        ${c.salePaid>0?`<span class="badge g">مدفوع: ${c.salePaid.toLocaleString()} ${cur()}${c.accPaid>0?` (منها ${c.accPaid.toLocaleString()} على الحساب)`:''}</span>`:''}
         ${c.salePending>0?`<span class="badge y">معلق: ${c.salePending.toLocaleString()} ${cur()}</span>`:''}
       </div>
     </div>`).join('');
@@ -3719,6 +3755,7 @@ window.accTab = async function(tab){
 };
 
 window.openSupPaySummary = async function(sup_id){
+  _accView = {type:'supSummary', id:sup_id};
   const sup = suppliers.find(s=>s.id===sup_id);
   if(!sup) return;
   const el = document.getElementById('acc-content');
@@ -3730,6 +3767,7 @@ window.openSupPaySummary = async function(sup_id){
 };
 
 window.openCustPaySummary = async function(cust_id){
+  _accView = {type:'custSummary', id:cust_id};
   const cust = customers.find(c=>c.id===cust_id);
   if(!cust) return;
   const el = document.getElementById('acc-content');
@@ -3779,6 +3817,7 @@ function paySummaryHTML(data, name, party_type, party_id){
 
 // ── عرض كل دفعات الحساب (مورد/زبون) مع تعديل وحذف مباشر ──
 window.openAllPayments = async function(party_type, party_id, name){
+  _accView = {type:'allPayments', party_type, party_id, name};
   const el = document.getElementById('acc-content');
   if(el) el.innerHTML='<div class="spin"></div>';
   try{
@@ -3981,15 +4020,17 @@ function repContent(type){
     <thead><tr><th>الزبون</th><th>المدينة</th><th>الطلبات</th><th>الاجمالي</th><th>المدفوع</th><th>المتبقي</th><th>إجراءات</th></tr></thead>
     <tbody>${customers.map(c=>{
       const o=sales.filter(s=>parseInt(s.customer_id)===c.id);
-      const totalSales = o.reduce((t,s)=>t+(s.total||0),0);
-      const totalPaid  = o.reduce((t,s)=>t+(s.paid||0),0);
-      const totalRem   = o.reduce((t,s)=>t+Math.max(0,(s.total||0)-(s.paid||0)),0);
+      const svcs=serviceOrders.filter(so=>parseInt(so.customer_id)===c.id);
+      const accPaid = customerAccountPaid(c.id);
+      const totalSales = o.reduce((t,s)=>t+(s.total||0),0) + svcs.reduce((t,so)=>t+(so.service_fee||0),0);
+      const totalPaid  = o.reduce((t,s)=>t+(s.paid||0),0) + svcs.reduce((t,so)=>t+(so.paid||0),0) + accPaid;
+      const totalRem   = customerReceivable(c.id);
       return `<tr>
-      <td style="font-weight:700;color:#f1f5f9;">${c.name}</td>
-      <td>${c.city||''}</td>
-      <td><span class="badge b">${o.length}</span></td>
+      <td style="font-weight:700;color:#f1f5f9;">${esc(c.name)}</td>
+      <td>${esc(c.city)||''}</td>
+      <td><span class="badge b">${o.length+svcs.length}</span>${svcs.length?`<span class="badge y" style="font-size:10px;margin-right:3px;">🔧${svcs.length}</span>`:''}</td>
       <td style="font-weight:700;">${totalSales.toLocaleString()} ${cur()}</td>
-      <td style="color:#52b788;font-weight:600;">${totalPaid.toLocaleString()} ${cur()}</td>
+      <td style="color:#52b788;font-weight:600;">${totalPaid.toLocaleString()} ${cur()}${accPaid>0?`<div style="font-size:10px;color:#94a3b8;">منها ${accPaid.toLocaleString()} على الحساب</div>`:''}</td>
       <td style="color:${totalRem>0?'#f87171':'#52b788'};font-weight:700;">${totalRem.toLocaleString()} ${cur()}</td>
       <td><div style="display:flex;gap:4px;">
         <button class="btn p" style="padding:3px 8px;font-size:11px;" onclick="doCustReport(${c.id})">📋 كشف حساب</button>
@@ -3997,9 +4038,9 @@ function repContent(type){
       </tr>`;}).join('')||'<tr><td colspan="7" style="text-align:center;color:#475569;padding:20px;">لا يوجد زبائن</td></tr>'}
     </tbody></table>
     <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:14px;border-top:1px solid #1e2537;">
-      <div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">إجمالي المبيعات</div><div style="font-size:16px;font-weight:800;color:#52b788;margin-top:5px;">${sales.reduce((s,x)=>s+(x.total||0),0).toLocaleString()} ${cur()}</div></div>
-      <div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">إجمالي المدفوع</div><div style="font-size:16px;font-weight:800;color:#60a5fa;margin-top:5px;">${sales.reduce((s,x)=>s+(x.paid||0),0).toLocaleString()} ${cur()}</div></div>
-      <div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">إجمالي المتبقي</div><div style="font-size:16px;font-weight:800;color:#fbbf24;margin-top:5px;">${sales.reduce((s,x)=>s+Math.max(0,(x.total||0)-(x.paid||0)),0).toLocaleString()} ${cur()}</div></div>
+      <div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">إجمالي المبيعات والخدمات</div><div style="font-size:16px;font-weight:800;color:#52b788;margin-top:5px;">${(sales.reduce((s,x)=>s+(x.total||0),0)+serviceOrders.reduce((s,x)=>s+(x.service_fee||0),0)).toLocaleString()} ${cur()}</div></div>
+      <div style="text-align:center;" class="stat"><div style="font-size:11px;color:#64748b;">إجمالي المدفوع</div><div style="font-size:16px;font-weight:800;color:#60a5fa;margin-top:5px;">${(sales.reduce((s,x)=>s+(x.paid||0),0)+serviceOrders.reduce((s,x)=>s+(x.paid||0),0)+accountPayments.filter(p=>p.party_type==='customer').reduce((s,x)=>s+(x.amount||0),0)).toLocaleString()} ${cur()}</div></div>
+      <div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">إجمالي المتبقي</div><div style="font-size:16px;font-weight:800;color:#fbbf24;margin-top:5px;">${customers.reduce((s,c)=>s+customerReceivable(c.id),0).toLocaleString()} ${cur()}</div></div>
     </div>
     </div>`;
 
@@ -6264,6 +6305,15 @@ window.removeSvcPart = function(idx){
   render();
 };
 
+// إعادة عرض نفس شاشة الحسابات اللي كانت مفتوحة (تبويب، كشف حساب مورد/زبون، أو كل الدفعات)
+async function refreshAccView(){
+  if(page!=='accounting') return;
+  if(_accView.type==='supSummary')   return openSupPaySummary(_accView.id);
+  if(_accView.type==='custSummary')  return openCustPaySummary(_accView.id);
+  if(_accView.type==='allPayments')  return openAllPayments(_accView.party_type, _accView.party_id, _accView.name);
+  return accTab(_accView.tab||'sum');
+}
+
 function closeM(){
   stopCameraScan();
   if(MS?._fromPurchase && _purDraftStash){
@@ -6272,6 +6322,7 @@ function closeM(){
     return;
   }
   MS=null; render();
+  if(page==='accounting') refreshAccView();
 }
 
 function bindModal(){
