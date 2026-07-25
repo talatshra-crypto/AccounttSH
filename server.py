@@ -2339,6 +2339,48 @@ tr:hover td{background:#1a1d27}
 .spin{width:32px;height:32px;border:3px solid #1e2537;border-top-color:#2d6a4f;border-radius:50%;animation:spin .8s linear infinite;margin:50px auto}
 .pos-sug-item:hover{background:#252839 !important}
 .pos-sug-item.active{background:#252839}
+.mob-backdrop{display:none}
+
+/* ══════════════════════════════════════════════
+   تجاوب مع شاشات الموبايل والأجهزة اللوحية
+   ══════════════════════════════════════════════ */
+@media (max-width: 860px){
+  .login-card{width:92vw !important;max-width:380px;padding:26px !important;}
+  .main-content{padding:12px !important;}
+  .ti{font-size:18px !important;}
+  .modal{max-width:96vw !important;width:96vw !important;padding:16px !important;max-height:94vh !important;}
+  .g2,
+  [style*="grid-template-columns:1fr 1fr"],
+  [style*="grid-template-columns:2fr 1fr"],
+  [style*="grid-template-columns:repeat(3,1fr)"],
+  [style*="grid-template-columns:repeat(4,1fr)"],
+  [style*="grid-template-columns:repeat(5,1fr)"],
+  [style*="grid-template-columns:repeat(6,1fr)"]
+  { grid-template-columns:repeat(2,1fr) !important; gap:10px !important; }
+  .pos-layout{ grid-template-columns:1fr !important; height:auto !important; overflow:visible !important; }
+  .pos-layout > div{ min-height:0 !important; }
+  .card{ overflow-x:auto !important; }
+  table{ min-width:560px; }
+  .sidebar{ position:fixed !important; z-index:400; height:100vh; box-shadow:4px 0 24px rgba(0,0,0,.5); }
+  .main-content{ margin-right:58px; }
+  .mob-backdrop{ display:block; position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:390; }
+}
+
+@media (max-width: 560px){
+  .login-card{padding:20px !important;}
+  .main-content{padding:8px !important;}
+  .stat{padding:12px !important;}
+  .g2,
+  [style*="grid-template-columns:1fr 1fr"],
+  [style*="grid-template-columns:2fr 1fr"],
+  [style*="grid-template-columns:repeat(3,1fr)"],
+  [style*="grid-template-columns:repeat(4,1fr)"],
+  [style*="grid-template-columns:repeat(5,1fr)"],
+  [style*="grid-template-columns:repeat(6,1fr)"]
+  { grid-template-columns:1fr !important; }
+  .btn{font-size:13px !important;padding:7px 12px !important;}
+  table{min-width:480px;}
+}
 </style>
 </head>
 <body>
@@ -2375,7 +2417,7 @@ async function api(method,path,body){
   return r.json();
 }
 
-let page='dashboard', sideOpen=true;
+let page='dashboard', sideOpen = window.innerWidth > 860;
 let MS = null;          // حالة النافذة المنبثقة الحالية (Modal State)
 let cart = [];          // سلة فاتورة الشراء الجارية
 let supStats = [], custStats = [];   // إحصاءات صفحة الحسابات
@@ -2580,7 +2622,7 @@ function render(){
 // ── LOGIN ──────────────────────────────────────
 function loginHTML(){
   return `<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0f1117;">
-  <div style="width:380px;padding:40px;background:#161923;border-radius:18px;border:1px solid #1e2537;box-shadow:0 24px 64px rgba(0,0,0,.5);">
+  <div class="login-card" style="width:380px;padding:40px;background:#161923;border-radius:18px;border:1px solid #1e2537;box-shadow:0 24px 64px rgba(0,0,0,.5);">
     <div style="text-align:center;margin-bottom:28px;">
       <div style="width:56px;height:56px;background:linear-gradient(135deg,#2d6a4f,#1b4332);border-radius:14px;display:flex;align-items:center;justify-content:center;margin:0 auto 14px;">
         <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
@@ -2714,8 +2756,8 @@ function appHTML(){
   const visibleNav = NAV.filter(n=>allowed.includes(n.id));
   // إعادة توجيه إذا الصفحة الحالية غير مسموح بها
   if(!allowed.includes(page)) page = allowed[0];
-  return `<div style="display:flex;height:100vh;overflow:hidden;">
-  <aside style="width:${w}px;min-width:${w}px;background:#0d1018;border-left:1px solid #1e2537;transition:all .25s;display:flex;flex-direction:column;overflow:hidden;">
+  return `<div class="app-shell" style="display:flex;height:100vh;overflow:hidden;">
+  <aside class="sidebar" style="width:${w}px;min-width:${w}px;background:#0d1018;border-left:1px solid #1e2537;transition:all .25s;display:flex;flex-direction:column;overflow:hidden;">
     <div style="padding:16px 12px;border-bottom:1px solid #1e2537;display:flex;align-items:center;gap:10px;">
       <div style="width:32px;height:32px;min-width:32px;background:linear-gradient(135deg,#2d6a4f,#1b4332);border-radius:8px;display:flex;align-items:center;justify-content:center;">
         ${ic('M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2zM9 22V12h6v10',15)}
@@ -2734,15 +2776,17 @@ function appHTML(){
       <div class="nav" style="color:#f87171;" id="lout">${ic('M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9',17)}${sideOpen?'<span>خروج</span>':''}</div>
     </div>
   </aside>
-  <main style="flex:1;overflow-y:auto;padding:22px;">
+  <main class="main-content" style="flex:1;overflow-y:auto;padding:22px;">
     ${loading?'<div class="spin"></div>':pageHTML()}
   </main>
+  ${sideOpen?`<div class="mob-backdrop" id="mobBackdrop"></div>`:''}
   </div>${modalHTML()}`;
 }
 
 function bindApp(){
-  document.querySelectorAll('[data-page]').forEach(el=>{el.onclick=()=>{page=el.dataset.page;render();};});
+  document.querySelectorAll('[data-page]').forEach(el=>{el.onclick=()=>{page=el.dataset.page;if(window.innerWidth<=860)sideOpen=false;render();};});
   document.getElementById('tog').onclick=()=>{sideOpen=!sideOpen;render();};
+  document.getElementById('mobBackdrop')?.addEventListener('click',()=>{sideOpen=false;render();});
   document.getElementById('lout').onclick=async()=>{
     try{ await api('POST','/api/auth/logout'); }catch(e){}
     TOKEN=null;USER=null;localStorage.removeItem('token');render();
@@ -3052,7 +3096,7 @@ function posHTML(){
   // تجميع الفئات
   const cats = [...new Set(products.map(p=>p.category||'عام'))];
 
-  return `<div style="display:grid;grid-template-columns:180px 1fr 480px;gap:0;height:calc(100vh - 44px);overflow:hidden;">
+  return `<div class="pos-layout" style="display:grid;grid-template-columns:180px 1fr 480px;gap:0;height:calc(100vh - 44px);overflow:hidden;">
 
   <!-- ══ يسار: الأصناف/الفئات ══ -->
   <div style="background:#0d1018;border-left:1px solid #1e2537;display:flex;flex-direction:column;overflow:hidden;">
