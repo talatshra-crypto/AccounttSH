@@ -2304,6 +2304,7 @@ HTML = r"""<!DOCTYPE html>
 <title>نظام ادارة المخازن</title>
 <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800;900&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.20.0/umd/index.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Tajawal',sans-serif;background:#0f1117;color:#e2e8f0;direction:rtl}
@@ -6121,26 +6122,27 @@ window.pickUnit = function(unitId){
   document.getElementById('pi')?.focus();
 };
 
-// ── نافذة المسح عبر كاميرا الجوال (BarcodeDetector API) ──
+// ── نافذة المسح عبر كاميرا الجوال (مكتبة ZXing — تعمل على كل المتصفحات بما فيها Safari/آيفون) ──
 function cameraScanModal(){
-  const supported = 'BarcodeDetector' in window;
+  const supported = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
   return `<div class="overlay" id="mover"><div class="modal" style="max-width:420px;text-align:center;">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
     <div style="font-size:16px;font-weight:800;color:#f1f5f9;">📷 مسح بالكاميرا</div>
     <button class="btn s" style="padding:4px 9px;" id="mc">✕</button>
   </div>
   ${supported ? `
-  <video id="cam-video" playsinline style="width:100%;border-radius:10px;background:#000;max-height:320px;"></video>
+  <video id="cam-video" playsinline muted style="width:100%;border-radius:10px;background:#000;max-height:320px;"></video>
   <div id="cam-status" style="margin-top:10px;color:#64748b;font-size:13px;">📡 جارِ تشغيل الكاميرا...</div>
   ` : `
   <div style="padding:24px;color:#f87171;font-size:14px;">
-    ⚠️ هذا المتصفح لا يدعم مسح الباركود بالكاميرا مباشرة.<br/>
-    <span style="color:#64748b;font-size:12px;">جرّب متصفح Chrome على أندرويد، أو استخدم قارئ باركود USB / الإدخال اليدوي.</span>
+    ⚠️ هذا المتصفح لا يدعم الوصول للكاميرا.<br/>
+    <span style="color:#64748b;font-size:12px;">استخدم قارئ باركود USB أو الإدخال اليدوي بدلاً من ذلك.</span>
   </div>`}
   </div></div>`;
 }
 
 let _camStream = null;
+let _zxingReader = null;
 window.openCameraScan = function(){
   MS = {type:'camerascan'}; render();
 };
@@ -6196,36 +6198,36 @@ window.seAutoFill = function(required){
 async function startCameraScan(){
   const video = document.getElementById('cam-video');
   const status = document.getElementById('cam-status');
-  if(!video || !('BarcodeDetector' in window)) return;
+  if(!video) return;
+  if(!(window.ZXing && window.ZXing.BrowserMultiFormatReader)){
+    if(status) status.textContent = '❌ تعذّر تحميل مكتبة قراءة الباركود (تحقق من الاتصال بالإنترنت) — استخدم الإدخال اليدوي';
+    return;
+  }
   try{
-    _camStream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
-    video.srcObject = _camStream;
-    await video.play();
-    const detector = new BarcodeDetector();
-    const loop = async()=>{
-      if(!MS || MS.type!=='camerascan') return; // أُغلقت النافذة
-      try{
-        const codes = await detector.detect(video);
-        if(codes && codes.length){
-          const val = codes[0].rawValue;
-          stopCameraScan();
-          closeM();
-          const inp = document.getElementById('pi');
-          if(inp){ inp.value = val; }
-          await posAdd();
-          return;
-        }
-      }catch(e){}
-      requestAnimationFrame(loop);
-    };
+    _zxingReader = new ZXing.BrowserMultiFormatReader();
+    const devices = await _zxingReader.listVideoInputDevices();
+    // نفضّل الكاميرا الخلفية إن أمكن تمييزها
+    const back = devices.find(d=>/back|rear|environment/i.test(d.label)) || devices[devices.length-1] || devices[0];
     if(status) status.textContent = '🎯 وجّه الكاميرا نحو الباركود...';
-    loop();
+    await _zxingReader.decodeFromVideoDevice(back?.deviceId, video, (result, err)=>{
+      if(!MS || MS.type!=='camerascan') return; // أُغلقت النافذة
+      if(result){
+        const val = result.getText();
+        stopCameraScan();
+        closeM();
+        const inp = document.getElementById('pi');
+        if(inp){ inp.value = val; }
+        posAdd();
+      }
+      // NotFoundException بتترمى بشكل طبيعي بكل فريم ما فيه باركود — نتجاهلها بصمت
+    });
   }catch(e){
-    if(status) status.textContent = '❌ تعذّر الوصول للكاميرا: '+e.message;
+    if(status) status.textContent = '❌ تعذّر الوصول للكاميرا: '+(e?.message||e);
   }
 }
 
 function stopCameraScan(){
+  if(_zxingReader){ try{ _zxingReader.reset(); }catch(e){} _zxingReader=null; }
   if(_camStream){ _camStream.getTracks().forEach(t=>t.stop()); _camStream=null; }
 }
 
