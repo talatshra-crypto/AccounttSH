@@ -6159,8 +6159,16 @@ function serialsEntryModal(d){
     <button class="btn s" style="padding:4px 9px;" id="se-cancel">✕</button>
   </div>
   <div id="merr"></div>
-  <label class="lbl">أدخل سيريال واحد بكل سطر (Enter بعد كل سيريال)</label>
-  <textarea id="se-textarea" class="inp" style="min-height:180px;font-family:monospace;font-size:13px;line-height:1.8;" placeholder="مثال:
+
+  <div id="se-cam-wrap" style="display:none;margin-bottom:10px;">
+    <video id="se-cam-video" playsinline muted style="width:100%;border-radius:10px;background:#000;max-height:220px;"></video>
+    <div id="se-cam-status" style="text-align:center;font-size:12px;color:#64748b;margin-top:6px;">📡 جارِ تشغيل الكاميرا...</div>
+    <button type="button" class="btn d" id="se-cam-stop" onclick="seStopCamScan()" style="width:100%;justify-content:center;margin-top:8px;">⏹ إيقاف المسح</button>
+  </div>
+  <button type="button" class="btn s" id="se-cam-start" onclick="seStartCamScan()" style="width:100%;justify-content:center;margin-bottom:10px;">📷 مسح السيريالات بالكاميرا (سطر لكل مسحة تلقائياً)</button>
+
+  <label class="lbl">أو أدخل سيريال واحد بكل سطر يدوياً (Enter بعد كل سيريال)</label>
+  <textarea id="se-textarea" class="inp" style="min-height:150px;font-family:monospace;font-size:13px;line-height:1.8;" placeholder="مثال:
 SN00123
 SN00124
 SN00125" oninput="seUpdateCounter(${d.qty})"></textarea>
@@ -6174,6 +6182,56 @@ SN00125" oninput="seUpdateCounter(${d.qty})"></textarea>
   </div>
   </div></div>`;
 }
+
+let _seZxingReader = null;
+
+// بدء المسح المستمر: كل سيريال يُمسح ينضاف كسطر جديد بمربع النص تلقائياً بدون إغلاق الكاميرا
+window.seStartCamScan = async function(){
+  const wrap   = document.getElementById('se-cam-wrap');
+  const video  = document.getElementById('se-cam-video');
+  const status = document.getElementById('se-cam-status');
+  const startBtn = document.getElementById('se-cam-start');
+  if(!wrap || !video) return;
+  wrap.style.display = 'block';
+  if(startBtn) startBtn.style.display = 'none';
+  if(!(window.ZXing && window.ZXing.BrowserMultiFormatReader)){
+    if(status) status.textContent = '❌ تعذّر تحميل مكتبة قراءة الباركود (تحقق من الاتصال بالإنترنت)';
+    return;
+  }
+  try{
+    _seZxingReader = new ZXing.BrowserMultiFormatReader();
+    const devices = await _seZxingReader.listVideoInputDevices();
+    const back = devices.find(d=>/back|rear|environment/i.test(d.label)) || devices[devices.length-1] || devices[0];
+    if(status) status.textContent = '🎯 وجّه الكاميرا نحو السيريال...';
+    await _seZxingReader.decodeFromVideoDevice(back?.deviceId, video, (result)=>{
+      if(!result) return;
+      if(!document.getElementById('se-cam-wrap')) return; // النافذة أُغلقت
+      const val = result.getText().trim();
+      if(!val) return;
+      const ta = document.getElementById('se-textarea');
+      if(!ta) return;
+      const existing = ta.value.split('\n').map(s=>s.trim()).filter(Boolean);
+      if(existing.includes(val)){
+        if(status) status.textContent = `⚠️ "${val}" مُدخَل مسبقاً — وجّه لسيريال آخر`;
+        return;
+      }
+      existing.push(val);
+      ta.value = existing.join('\n');
+      seUpdateCounter(MS?.data?.qty||0);
+      if(status) status.textContent = `✅ تمت إضافة: ${val} — وجّه للسيريال التالي`;
+    });
+  }catch(e){
+    if(status) status.textContent = '❌ تعذّر الوصول للكاميرا: '+(e?.message||e);
+  }
+};
+
+window.seStopCamScan = function(){
+  if(_seZxingReader){ try{ _seZxingReader.reset(); }catch(e){} _seZxingReader=null; }
+  const wrap = document.getElementById('se-cam-wrap');
+  const startBtn = document.getElementById('se-cam-start');
+  if(wrap) wrap.style.display = 'none';
+  if(startBtn) startBtn.style.display = 'flex';
+};
 
 window.seUpdateCounter = function(required){
   const ta = document.getElementById('se-textarea');
@@ -6891,6 +6949,7 @@ async function refreshAccView(){
 
 function closeM(){
   stopCameraScan();
+  seStopCamScan();
   if(MS?._fromPurchase && _purDraftStash){
     MS = _purDraftStash; _purDraftStash = null;
     render();
@@ -6912,6 +6971,7 @@ function bindModal(){
   if(MS?.type==='serialsentry'){
     const d = MS.data||{};
     const backToContext = ()=>{
+      seStopCamScan();
       if(d.context==='editpur') MS = {type:'editpur', editId:d.editId, data:d.editData};
       else MS = {type:'purform'};
       render();
@@ -6938,6 +6998,7 @@ function bindModal(){
         if(errEl) errEl.innerHTML = `<div class="err">أحد السيريالات مضاف مسبقاً بنفس الفاتورة</div>`;
         return;
       }
+      seStopCamScan();
       // كل قطعة مسلسلة = سطر مستقل بالسلة (لا تُدمج مع أصناف أخرى لنفس المنتج)
       cart.push({product_id:d.product.id, name:d.product.name, qty:d.qty, price:d.price, serials});
       backToContext();
