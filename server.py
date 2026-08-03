@@ -3295,6 +3295,7 @@ function renderEntity(type,q=''){
     <td><span class="badge ${x.balance!==0?'y':'g'}">${Math.abs(x.balance||0).toLocaleString()} ${cur()}</span></td>
     <td><div style="display:flex;gap:5px;">
       <button class="btn p" style="padding:4px 9px;font-size:12px;background:linear-gradient(135deg,#1e40af,#1e3a8a);" onclick="openAccountPay('${type}',${x.id},'${x.name}')">💳 دفعة</button>
+      <button class="btn s" style="padding:4px 8px;" onclick="openPaymentsListModal('${type}',${x.id},'${x.name.replace(/'/g,"\\'")}')" title="سجل الدفعات (تعديل/حذف)">📋 الدفعات</button>
       ${type==='customers'?`<button class="btn s" style="padding:4px 8px;" onclick="copyCustomerStatement(${x.id})" title="نسخ كشف حساب جاهز للإرسال">📋</button>`:''}
       <button class="btn s" style="padding:4px 8px;" onclick="openEdit('${type}',${x.id})">✏️</button>
       <button class="btn d" style="padding:4px 8px;" onclick="delItem('${type}',${x.id})">🗑️</button>
@@ -4235,6 +4236,34 @@ window.openAllPayments = async function(party_type, party_id, name){
   }
 };
 
+// فتح سجل الدفعات كنافذة منبثقة مباشرة من صفحة الموردين/الزبائن (بدون المرور عبر صفحة الحسابات)
+window.openPaymentsListModal = async function(entityType, party_id, name){
+  const party_type = entityType==='suppliers' ? 'supplier' : 'customer';
+  MS = {type:'paymentslist', data:{party_type, party_id, name, payments:[], loading:true}};
+  render();
+  try{
+    const pays = await api('GET', `/api/payments?party_type=${party_type}&party_id=${party_id}`);
+    if(MS?.type==='paymentslist'){
+      MS.data.payments = pays; MS.data.loading = false;
+      render();
+    }
+  }catch(e){
+    if(MS?.type==='paymentslist'){ MS.data.error = e.message; MS.data.loading = false; render(); }
+  }
+};
+
+function paymentsListModal(d){
+  return `<div class="overlay" id="mover"><div class="modal" style="max-width:820px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+    <div style="font-size:16px;font-weight:800;color:#f1f5f9;">📋 سجل دفعات: ${esc(d.name)}</div>
+    <button class="btn s" style="padding:4px 9px;" id="mc">✕</button>
+  </div>
+  ${d.loading ? '<div class="spin"></div>'
+    : d.error ? `<div class="err">${esc(d.error)}</div>`
+    : allPaymentsHTML(d.payments, d.name, d.party_type, d.party_id)}
+  </div></div>`;
+}
+
 function allPaymentsHTML(pays, name, party_type, party_id){
   const total = pays.reduce((s,p)=>s+p.amount,0);
   const ref_type = party_type==='supplier' ? 'purchase' : 'sale';
@@ -4276,7 +4305,12 @@ window.deletePaymentDirect = async function(id, party_type, party_id, name){
   try{
     await api('DELETE','/api/payments/'+id);
     await loadAll();
-    await openAllPayments(party_type, party_id, name);
+    if(MS?.type==='paymentslist'){
+      const entityType = party_type==='supplier' ? 'suppliers' : 'customers';
+      await openPaymentsListModal(entityType, party_id, name);
+    } else {
+      await openAllPayments(party_type, party_id, name);
+    }
   }catch(e){ alert('خطأ: '+e.message); }
 };
 
@@ -5449,6 +5483,7 @@ function modalHTML(){
   if(MS.type==='payrollform') return payrollFormModal(MS.data||{});
   if(MS.type==='quoteform') return quoteFormModal(MS.data||{});
   if(MS.type==='quotedetail') return quoteDetailModal(MS.data||{});
+  if(MS.type==='paymentslist') return paymentsListModal(MS.data||{});
   return '';
 }
 
@@ -7483,7 +7518,13 @@ function bindModal(){
         await api('PUT','/api/payments/'+MS.data.id, body);
         window._epDeleteImage = false;
         await loadAll();
+        const pt = MS.data.party_type, pid = MS.data.party_id;
         closeM();
+        if(pt && pid){
+          const entityType = pt==='supplier' ? 'suppliers' : 'customers';
+          const nm = (pt==='supplier' ? suppliers : customers).find(x=>x.id===parseInt(pid))?.name || '';
+          if(nm) await openPaymentsListModal(entityType, pid, nm);
+        }
       }catch(e){
         errEl.innerHTML='<div class="err">'+e.message+'</div>';
         btn.disabled=false; btn.textContent='💾 حفظ التعديل';
