@@ -16,6 +16,64 @@ BACKUP_DIR   = os.path.join(_base, "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 # ══════════════════════════════════════════════
+#  Rate Limiting بسيط لتسجيل الدخول (حماية من هجمات القوة الغاشمة)
+# ══════════════════════════════════════════════
+LOGIN_MAX_ATTEMPTS_PER_ACCOUNT = 5     # عدد المحاولات الفاشلة المسموحة لنفس (IP + اسم المستخدم)
+LOGIN_MAX_ATTEMPTS_PER_IP      = 20    # عدد المحاولات الفاشلة المسموحة لنفس الـ IP (كل الحسابات)
+LOGIN_LOCKOUT_SECONDS          = 10 * 60  # مدة القفل: 10 دقائق
+
+_login_attempts = {}   # key -> [timestamps من المحاولات الفاشلة]
+_login_lock = threading.Lock()
+
+def _client_ip(req):
+    """يحاول قراءة IP الحقيقي للعميل (يدعم X-Forwarded-For خلف بروكسي مثل Railway)"""
+    try:
+        xff = req.headers.get("X-Forwarded-For", "")
+        if xff:
+            return xff.split(",")[0].strip()
+        return req.client_address[0]
+    except Exception:
+        return "unknown"
+
+def _login_rl_check(key, max_attempts):
+    """يرجع (allowed, retry_after_seconds) بعد تنظيف المحاولات المنتهية الصلاحية"""
+    now = time.time()
+    with _login_lock:
+        attempts = [t for t in _login_attempts.get(key, []) if now - t < LOGIN_LOCKOUT_SECONDS]
+        _login_attempts[key] = attempts
+        if len(attempts) >= max_attempts:
+            retry_after = int(LOGIN_LOCKOUT_SECONDS - (now - attempts[0]))
+            return False, max(retry_after, 1)
+        return True, 0
+
+def check_login_rate_limit(ip, username):
+    """يفحص الحدين معاً (لكل IP، ولكل حساب+IP) ويرجع أشد نتيجة"""
+    allowed_ip, retry_ip = _login_rl_check("ip:"+ip, LOGIN_MAX_ATTEMPTS_PER_IP)
+    if not allowed_ip:
+        return False, retry_ip
+    allowed_acc, retry_acc = _login_rl_check("acc:"+ip+"|"+username.lower(), LOGIN_MAX_ATTEMPTS_PER_ACCOUNT)
+    if not allowed_acc:
+        return False, retry_acc
+    return True, 0
+
+def record_failed_login(ip, username):
+    now = time.time()
+    with _login_lock:
+        _login_attempts.setdefault("ip:"+ip, []).append(now)
+        _login_attempts.setdefault("acc:"+ip+"|"+username.lower(), []).append(now)
+        # تنظيف دوري بسيط لمنع تضخم الذاكرة على المدى الطويل
+        if len(_login_attempts) > 5000:
+            for k in list(_login_attempts.keys()):
+                _login_attempts[k] = [t for t in _login_attempts[k] if now - t < LOGIN_LOCKOUT_SECONDS]
+                if not _login_attempts[k]:
+                    del _login_attempts[k]
+
+def clear_login_attempts(ip, username):
+    with _login_lock:
+        _login_attempts.pop("ip:"+ip, None)
+        _login_attempts.pop("acc:"+ip+"|"+username.lower(), None)
+
+# ══════════════════════════════════════════════
 #  قاعدة البيانات
 # ══════════════════════════════════════════════
 def get_db():
@@ -137,7 +195,8 @@ def init_db():
         product_id INTEGER REFERENCES products(id),
         qty INTEGER DEFAULT 1,
         price REAL DEFAULT 0,
-        discount REAL DEFAULT 0
+        discount REAL DEFAULT 0,
+        cost_price REAL DEFAULT NULL
     );
     CREATE TABLE IF NOT EXISTS product_units(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -318,6 +377,11 @@ def init_db():
     except: pass
     try:
         c.execute("ALTER TABLE sale_items ADD COLUMN discount REAL DEFAULT 0")
+        c.commit()
+    except: pass
+    # إضافة عمود تسجيل تكلفة الشراء وقت البيع (Snapshot) لدقة تقارير الربح (للقواعد القديمة)
+    try:
+        c.execute("ALTER TABLE sale_items ADD COLUMN cost_price REAL DEFAULT NULL")
         c.commit()
     except: pass
     if not row1(c.execute("SELECT id FROM users WHERE username='admin'")):
@@ -671,9 +735,9 @@ class SalesDAO(BaseDAO):
     def delete(c, sid):
         c.execute("DELETE FROM sales WHERE id=?", (sid,))
     @staticmethod
-    def create_item(c, sid, product_id, qty, price, discount=0):
-        c.execute("INSERT INTO sale_items(sale_id,product_id,qty,price,discount) VALUES(?,?,?,?,?)",
-                  (sid, product_id, qty, price, discount))
+    def create_item(c, sid, product_id, qty, price, discount=0, cost_price=None):
+        c.execute("INSERT INTO sale_items(sale_id,product_id,qty,price,discount,cost_price) VALUES(?,?,?,?,?,?)",
+                  (sid, product_id, qty, price, discount, cost_price))
     @staticmethod
     def delete_items(c, sid):
         c.execute("DELETE FROM sale_items WHERE sale_id=?", (sid,))
@@ -804,8 +868,10 @@ class ExpenseCategoriesDAO(BaseDAO):
 class ExpensesDAO(BaseDAO):
     @staticmethod
     def list(c, date_from=None, date_to=None, category_id=None):
-        sql = """SELECT e.*, ec.name AS category_name, ec.icon AS category_icon
-                 FROM expenses e LEFT JOIN expense_categories ec ON ec.id=e.category_id WHERE 1=1"""
+        sql = """SELECT e.*, ec.name AS category_name, ec.icon AS category_icon,
+                 emp.name AS employee_name
+                 FROM expenses e LEFT JOIN expense_categories ec ON ec.id=e.category_id
+                 LEFT JOIN employees emp ON emp.id=e.employee_id WHERE 1=1"""
         params = []
         if date_from: sql += " AND e.date>=?"; params.append(date_from)
         if date_to:   sql += " AND e.date<=?"; params.append(date_to)
@@ -814,7 +880,9 @@ class ExpensesDAO(BaseDAO):
         return BaseDAO.rows(c.execute(sql, params))
     @staticmethod
     def get_by_id(c, eid):
-        return BaseDAO.row1(c.execute("SELECT * FROM expenses WHERE id=?", (eid,)))
+        return BaseDAO.row1(c.execute(
+            "SELECT e.*, emp.name AS employee_name FROM expenses e "
+            "LEFT JOIN employees emp ON emp.id=e.employee_id WHERE e.id=?", (eid,)))
     @staticmethod
     def create(c, data):
         cur = c.execute(
@@ -828,11 +896,11 @@ class ExpensesDAO(BaseDAO):
     @staticmethod
     def update(c, eid, data):
         c.execute(
-            "UPDATE expenses SET category_id=?,description=?,amount=?,date=?,payment_method=?,cheque_no=?,cheque_date=?,cheque_bank=?,cheque_image=?,notes=? WHERE id=?",
+            "UPDATE expenses SET category_id=?,description=?,amount=?,date=?,payment_method=?,cheque_no=?,cheque_date=?,cheque_bank=?,cheque_image=?,notes=?,employee_id=? WHERE id=?",
             (data.get("category_id"), data.get("description",""), float(data.get("amount",0) or 0),
              data.get("date",""), data.get("payment_method","نقدي"), data.get("cheque_no",""),
              data.get("cheque_date",""), data.get("cheque_bank",""), data.get("cheque_image",""),
-             data.get("notes",""), eid))
+             data.get("notes",""), data.get("employee_id"), eid))
     @staticmethod
     def delete(c, eid):
         c.execute("DELETE FROM expenses WHERE id=?", (eid,))
@@ -1356,13 +1424,20 @@ def handle_api(method, path, body, req):
     # AUTH login
     if len(parts) >= 3 and parts[1] == "auth" and parts[2] == "login":
         uname = body.get("username",""); p = body.get("password","")
+        ip = _client_ip(req)
+        allowed, retry_after = check_login_rate_limit(ip, uname)
+        if not allowed:
+            minutes = max(1, (retry_after + 59) // 60)
+            return 429, {"detail": f"محاولات دخول فاشلة كثيرة — يرجى المحاولة بعد {minutes} دقيقة"}
         c = get_db()
         user = UsersDAO.get_by_username(c, uname)
         if not user or not verify_password(p, user.get("salt",""), user["password"]):
             c.close()
+            record_failed_login(ip, uname)
             return 401, {"detail": "اسم المستخدم او كلمة المرور غير صحيحة"}
         if not user.get("is_active", 1):
             c.close()
+            record_failed_login(ip, uname)
             return 401, {"detail": "الحساب موقف — تواصل مع المدير"}
         # ترحيل المستخدمين القدامى (salt فارغ) إلى التشفير الجديد
         if not user.get("salt",""):
@@ -1376,6 +1451,7 @@ def handle_api(method, path, body, req):
         SessionsDAO.delete_by_user(c, user["id"])
         SessionsDAO.create(c, user["id"], token)
         c.commit(); c.close()
+        clear_login_attempts(ip, uname)
         return 200, {"access_token": token, "token_type": "bearer",
                      "user": {"id":user["id"],"username":user["username"],
                               "full_name":user["full_name"],"role":user["role"],"is_active":1}}
@@ -1750,7 +1826,9 @@ def handle_api(method, path, body, req):
             sid = SalesDAO.create(c, body.get("customer_id"), body.get("date",""), body.get("status","مدفوع"),
                                   body.get("pay_method","نقدي"), body.get("notes",""), total, invoice_discount)
             for i in items:
-                SalesDAO.create_item(c, sid, i["product_id"], i["qty"], i["price"], float(i.get("discount",0) or 0))
+                prod = ProductsDAO.get_by_id(c, i["product_id"])
+                cost_snapshot = (prod["buy_price"] if prod else 0) or 0
+                SalesDAO.create_item(c, sid, i["product_id"], i["qty"], i["price"], float(i.get("discount",0) or 0), cost_snapshot)
                 ProductsDAO.update_stock(c, i["product_id"], -i["qty"])
                 serials = [s.strip() for s in i.get("serials",[]) if str(s).strip()]
                 for s in serials:
@@ -1773,7 +1851,9 @@ def handle_api(method, path, body, req):
             SalesDAO.update(c, sid, body.get("customer_id"), body.get("date",""), body.get("status","مدفوع"),
                             body.get("pay_method","نقدي"), body.get("notes",""), total, invoice_discount)
             for i in items:
-                SalesDAO.create_item(c, sid, i["product_id"], i["qty"], i["price"], float(i.get("discount",0) or 0))
+                prod = ProductsDAO.get_by_id(c, i["product_id"])
+                cost_snapshot = (prod["buy_price"] if prod else 0) or 0
+                SalesDAO.create_item(c, sid, i["product_id"], i["qty"], i["price"], float(i.get("discount",0) or 0), cost_snapshot)
                 ProductsDAO.update_stock(c, i["product_id"], -i["qty"])
                 serials = [s2.strip() for s2 in i.get("serials",[]) if str(s2).strip()]
                 for s2 in serials:
@@ -2120,7 +2200,9 @@ def handle_api(method, path, body, req):
                 sale_id = SalesDAO.create(c, customer_id, today, "معلق", "آجل",
                                           f"محوّل من عرض سعر #{qid}", sale_total, 0)
                 for i in product_items:
-                    SalesDAO.create_item(c, sale_id, i["product_id"], i["qty"], i["price"], 0)
+                    prod = ProductsDAO.get_by_id(c, i["product_id"])
+                    cost_snapshot = (prod["buy_price"] if prod else 0) or 0
+                    SalesDAO.create_item(c, sale_id, i["product_id"], i["qty"], i["price"], 0, cost_snapshot)
                     ProductsDAO.update_stock(c, i["product_id"], -i["qty"])
             if service_items:
                 svc_fee = sum(i["qty"]*i["price"] for i in service_items)
@@ -2475,14 +2557,30 @@ function customerTier(custId){
 }
 
 // اكتشاف تأخر الزبون بالسداد: أقدم فاتورة غير مسددة بالكامل وعمرها بالأيام يتجاوز الحد المحدد بالإعدادات
+// (تُخصَم دفعات "على الحساب" المباشرة من الفواتير الأقدم أولاً قبل تحديد المتأخر، حتى لا يظهر زبون سدّد فعلياً كمتأخر)
 function customerOverdueInfo(custId){
   const days = parseInt(sysSettings.overdue_days_threshold||30);
   const unpaidSales = sales.filter(s=>parseInt(s.customer_id)===parseInt(custId) && (s.remaining||0) > 0)
     .map(s=>({date:s.date, remaining:s.remaining}));
   const unpaidServices = serviceOrders.filter(o=>parseInt(o.customer_id)===parseInt(custId) && (o.remaining||0) > 0)
     .map(o=>({date:o.received_date, remaining:o.remaining}));
-  const unpaid = [...unpaidSales, ...unpaidServices];
+  let unpaid = [...unpaidSales, ...unpaidServices];
   if(!unpaid.length) return null;
+
+  // توزيع دفعات الحساب المباشرة على الفواتير الأقدم أولاً (FIFO)
+  let accPaid = customerAccountPaid(custId);
+  if(accPaid > 0){
+    unpaid = unpaid.slice().sort((a,b)=> (a.date||'').localeCompare(b.date||'')).map(u=>({...u}));
+    for(const inv of unpaid){
+      if(accPaid <= 0) break;
+      const apply = Math.min(accPaid, inv.remaining);
+      inv.remaining -= apply;
+      accPaid -= apply;
+    }
+    unpaid = unpaid.filter(u=>u.remaining > 0.001);
+  }
+  if(!unpaid.length) return null;
+
   const oldest = unpaid.reduce((a,b)=> (a.date < b.date ? a : b));
   const ageDays = Math.floor((new Date() - new Date(oldest.date)) / 86400000);
   if(ageDays < days) return null;
@@ -3476,7 +3574,9 @@ function expListHTML(list){
       ${list.map(e=>`<tr>
         <td style="font-weight:600;">${e.date}</td>
         <td><span class="badge b">${e.category_icon||'📦'} ${esc(e.category_name)||'—'}</span></td>
-        <td style="font-weight:600;color:#f1f5f9;">${esc(e.description)}${e.payroll_id?' <span class="badge g" style="font-size:10px;">راتب</span>':''}${e.recurring_id?' <span class="badge y" style="font-size:10px;">متكرر</span>':''}</td>
+        <td style="font-weight:600;color:#f1f5f9;">${esc(e.description)}${e.payroll_id?' <span class="badge g" style="font-size:10px;">راتب</span>':''}${e.recurring_id?' <span class="badge y" style="font-size:10px;">متكرر</span>':''}
+          ${e.employee_name?`<div style="font-size:11px;color:#60a5fa;margin-top:2px;">👤 ${esc(e.employee_name)}</div>`:''}
+        </td>
         <td style="font-weight:800;color:#f87171;">${(e.amount||0).toLocaleString()} ${cur()}</td>
         <td><span class="badge ${e.payment_method==='نقدي'?'g':e.payment_method==='شيك'?'b':'y'}">${e.payment_method}</span></td>
         <td style="font-size:12px;color:#64748b;">${esc(e.notes)||''}</td>
@@ -4099,7 +4199,19 @@ window.accTab = async function(tab){
                 : customers.find(c=>c.id===parseInt(p.party_id))?.name||'—';
               return '<tr>'
                 + '<td style="font-weight:600;">'+p.date+'</td>'
-                + '<td><div style="font-size:12px;"><span class="badge '+(p.ref_type==='purchase'?'b':'g')+'">'+(p.ref_type==='purchase'?'شراء':'بيع')+'</span><div style="color:#94a3b8;font-size:11px;margin-top:2px;">'+party+'</div></div></td>'
+                + (()=>{
+                    let label, cls;
+                    if(p.ref_type==='account'){
+                      label = p.party_type==='supplier' ? '💼 دفعة حساب (شراء)' : '💼 دفعة حساب (بيع)';
+                      cls   = p.party_type==='supplier' ? 'b' : 'g';
+                    } else if(p.ref_type==='service'){
+                      label = '🔧 خدمة'; cls='y';
+                    } else {
+                      label = p.ref_type==='purchase' ? 'شراء' : 'بيع';
+                      cls   = p.ref_type==='purchase' ? 'b' : 'g';
+                    }
+                    return '<td><div style="font-size:12px;"><span class="badge '+cls+'">'+label+'</span><div style="color:#94a3b8;font-size:11px;margin-top:2px;">'+party+'</div></div></td>';
+                  })()
                 + '<td style="font-weight:800;color:#52b788;">'+p.amount.toLocaleString()+' ر.س</td>'
                 + '<td><span class="badge '+(p.method==='نقدي'?'g':p.method==='شيك'?'b':'y')+'">'+p.method+'</span></td>'
                 + '<td style="font-family:monospace;color:#60a5fa;">'+(p.cheque_no||'—')+'</td>'
@@ -4326,7 +4438,7 @@ function reportsHTML(){
     <div class="stat"><div style="font-size:13px;color:#64748b;">الربح الصافي</div><div style="font-size:19px;font-weight:800;color:#fbbf24;margin-top:7px;">${(ts-tp-te).toLocaleString()} ${cur()}</div></div>
   </div>
   <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;" id="rep-tabs">
-    ${[['sales','المبيعات'],['top-products','الأكثر/الأقل مبيعاً 📈'],['purchases','المشتريات'],['expenses-report','المصاريف 💸'],['sup-compare','مقارنة أسعار الموردين ⚖️'],['cheques','الشيكات 🏦'],['sup-detail','كشف مورد 🔍'],['cust-detail','كشف زبون 🔍'],['customers','ملخص الزبائن'],['inventory','المخزون']
+    ${[['sales','المبيعات'],['detailed','التفصيلي (شراء/بيع/خدمة) 🧾'],['top-products','الأكثر/الأقل مبيعاً 📈'],['purchases','المشتريات'],['expenses-report','المصاريف 💸'],['sup-compare','مقارنة أسعار الموردين ⚖️'],['cheques','الشيكات 🏦'],['sup-detail','كشف مورد 🔍'],['cust-detail','كشف زبون 🔍'],['customers','ملخص الزبائن'],['inventory','المخزون']
     ].map(([id,label],i)=>`<button class="btn ${i===0?'p':'s'}" data-rep="${id}">${label}</button>`).join('')}
   </div>
   <div id="rc">${repContent('sales')}</div>`;
@@ -4351,6 +4463,36 @@ function repContent(type){
       </div>
     </div>
     <div id="sales-rep-body"><div class="spin"></div></div>`;
+  }
+
+  if(type==='detailed'){
+    const today=new Date().toISOString().slice(0,10);
+    const first=today.slice(0,7)+'-01';
+    return `
+    <div class="card" style="padding:16px;margin-bottom:14px;">
+      <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;align-items:end;">
+        <div><label class="lbl">من تاريخ</label><input class="inp" type="date" id="drep-from" value="${first}"/></div>
+        <div><label class="lbl">إلى تاريخ</label><input class="inp" type="date" id="drep-to" value="${today}"/></div>
+        <div><label class="lbl">النوع</label>
+          <select class="inp" id="drep-kind">
+            <option value="">الكل (بيع + خدمة)</option>
+            <option value="sale">مبيعات فقط</option>
+            <option value="service">خدمات فقط</option>
+          </select>
+        </div>
+        <div style="position:relative;">
+          <label class="lbl">الزبون</label>
+          <input class="inp" id="drep-cust-search" placeholder="🔍 ابحث عن زبون..." autocomplete="off"
+            oninput="drepFilterCustList(this.value)" onfocus="drepFilterCustList(this.value)"/>
+          <input type="hidden" id="drep-customer" value=""/>
+          <div id="drep-cust-list" style="display:none;position:absolute;top:100%;right:0;left:0;
+            background:#1e2130;border:1px solid #2d6a4f;border-radius:0 0 8px 8px;max-height:220px;
+            overflow-y:auto;z-index:150;box-shadow:0 8px 28px rgba(0,0,0,.5);"></div>
+        </div>
+        <div><button class="btn p" style="width:100%;height:42px;justify-content:center;" onclick="renderDetailedReport()">🔍 تطبيق الفلترة</button></div>
+      </div>
+    </div>
+    <div id="detailed-rep-body"><div class="spin"></div></div>`;
   }
 
   if(type==='top-products'){
@@ -4575,12 +4717,14 @@ window.renderSalesReport = function(){
   if(status) list = list.filter(s => s.status === status);
   list = [...list].sort((a,b)=> (a.date||'').localeCompare(b.date||''));
 
-  // هامش الربح: نستخدم سعر الشراء الحالي للمنتج كأفضل تقدير متاح (لا يوجد سجل تكلفة تاريخي لكل عملية بيع)
+  // هامش الربح: نستخدم التكلفة المسجَّلة فعلياً وقت البيع (cost_price) إن وُجدت (فواتير حديثة)،
+  // وإلا نرجع لسعر الشراء الحالي كأفضل تقدير متاح (فواتير قديمة قبل تفعيل هذا التسجيل)
   const withMargin = list.map(s=>{
     let cost = 0;
     (s.items||[]).forEach(it=>{
       const prod = products.find(p=>p.id===it.product_id);
-      cost += (prod ? prod.buy_price : 0) * (it.qty||0);
+      const unitCost = (it.cost_price!=null) ? it.cost_price : (prod ? prod.buy_price : 0);
+      cost += unitCost * (it.qty||0);
     });
     const revenue = s.total||0;
     const profit  = revenue - cost;
@@ -4665,8 +4809,135 @@ function salesChartHTML(list){
 }
 
 // ══════════════════════════════════════════════
-//  تقرير المصاريف: فلترة + تجميع حسب التصنيف
+//  التقرير التفصيلي: سعر الشراء مقابل سعر البيع لكل صنف + الخدمات
 // ══════════════════════════════════════════════
+
+// اقتراحات البحث عن زبون داخل فلتر التقرير التفصيلي
+window.drepFilterCustList = function(q){
+  const box = document.getElementById('drep-cust-list');
+  if(!box) return;
+  q = (q||'').trim();
+  let list = customers;
+  if(q) list = customers.filter(c=>c.name.includes(q) || (c.phone||'').includes(q));
+  list = list.slice(0,50);
+  let html = '';
+  if(!q){
+    html += `<div class="pos-sug-item" onclick="drepPickCustomer('','')"
+      style="padding:9px 14px;cursor:pointer;border-bottom:1px solid #2d3349;font-weight:700;color:#52b788;">
+      -- كل الزبائن --</div>`;
+  }
+  html += list.map(c=>`
+    <div class="pos-sug-item" onclick="drepPickCustomer('${c.id}','${c.name.replace(/'/g,"\\'")}')"
+      style="padding:9px 14px;cursor:pointer;border-bottom:1px solid #2d3349;">
+      <div style="font-weight:700;color:#f1f5f9;font-size:13px;">${esc(c.name)}</div>
+      ${c.phone?`<div style="font-size:11px;color:#64748b;margin-top:2px;">${esc(c.phone)}</div>`:''}
+    </div>`).join('');
+  if(!list.length && q){
+    html += `<div style="padding:12px;color:#64748b;text-align:center;font-size:12px;">لا توجد نتائج</div>`;
+  }
+  box.innerHTML = html;
+  box.style.display = 'block';
+};
+
+window.drepPickCustomer = function(id, name){
+  const searchEl = document.getElementById('drep-cust-search');
+  const hiddenEl = document.getElementById('drep-customer');
+  const box = document.getElementById('drep-cust-list');
+  if(searchEl) searchEl.value = name || '';
+  if(hiddenEl) hiddenEl.value = id || '';
+  if(box) box.style.display = 'none';
+};
+
+document.addEventListener('click', function(e){
+  const box = document.getElementById('drep-cust-list');
+  const inp = document.getElementById('drep-cust-search');
+  if(box && inp && !inp.contains(e.target) && !box.contains(e.target)){
+    box.style.display = 'none';
+  }
+});
+
+window.renderDetailedReport = function(){
+  const el = document.getElementById('detailed-rep-body');
+  if(!el) return;
+  const from = document.getElementById('drep-from')?.value || '2000-01-01';
+  const to   = document.getElementById('drep-to')?.value   || '2099-12-31';
+  const kind = document.getElementById('drep-kind')?.value || '';
+  const custIdRaw = document.getElementById('drep-customer')?.value || '';
+  const custId = custIdRaw ? parseInt(custIdRaw) : null;
+
+  const rows = [];
+
+  if(kind !== 'service'){
+    sales.filter(s=>s.date>=from && s.date<=to && (!custId || parseInt(s.customer_id)===custId)).forEach(s=>{
+      const custName = customers.find(c=>c.id===parseInt(s.customer_id))?.name || 'زبون عام';
+      groupInvoiceItems(s.items||[]).forEach(item=>{
+        const prod = products.find(p=>p.id===item.product_id);
+        const buyPrice = (item.cost_price!=null) ? item.cost_price : (prod ? (prod.buy_price||0) : 0);
+        const sellPrice = item.price||0;
+        const qty = item.qty||0;
+        rows.push({
+          date: s.date, kind:'sale', ref: '#'+s.id, party: custName,
+          desc: item.product_name || prod?.name || ('منتج #'+item.product_id),
+          qty, buyPrice, sellPrice, margin: (sellPrice-buyPrice)*qty, total: sellPrice*qty
+        });
+      });
+    });
+  }
+
+  if(kind !== 'sale'){
+    serviceOrders.filter(o=>(o.received_date||'')>=from && (o.received_date||'')<=to && (!custId || parseInt(o.customer_id)===custId)).forEach(o=>{
+      const buyPrice = o.parts_cost||0;
+      const sellPrice = o.service_fee||0;
+      rows.push({
+        date: o.received_date, kind:'service', ref:'#'+o.id, party: o.customer_name||'—',
+        desc: (o.service_type||'خدمة') + (o.device_desc?(' — '+o.device_desc):''),
+        qty:1, buyPrice, sellPrice, margin: sellPrice-buyPrice, total: sellPrice
+      });
+    });
+  }
+
+  rows.sort((a,b)=>(a.date||'').localeCompare(b.date||''));
+
+  const totalSell   = rows.reduce((s,r)=>s+r.total,0);
+  const totalBuy    = rows.reduce((s,r)=>s+r.buyPrice*r.qty,0);
+  const totalMargin = rows.reduce((s,r)=>s+r.margin,0);
+  const custObj     = custId ? customers.find(c=>c.id===custId) : null;
+
+  el.innerHTML = `
+  ${custObj?`<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+    <span class="badge b" style="font-size:12px;padding:6px 12px;">👤 مفلتَر حسب: ${esc(custObj.name)}</span>
+    <button class="btn s" style="padding:3px 10px;font-size:11px;" onclick="drepPickCustomer('','');renderDetailedReport();">✕ إزالة الفلتر</button>
+  </div>`:''}
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px;">
+    <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">عدد العمليات</div><div style="font-size:18px;font-weight:800;color:#60a5fa;margin-top:5px;">${rows.length}</div></div>
+    <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">إجمالي البيع</div><div style="font-size:18px;font-weight:800;color:#52b788;margin-top:5px;">${totalSell.toLocaleString()} ${cur()}</div></div>
+    <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">إجمالي التكلفة (شراء)</div><div style="font-size:18px;font-weight:800;color:#f87171;margin-top:5px;">${totalBuy.toLocaleString()} ${cur()}</div></div>
+    <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">هامش الربح</div><div style="font-size:18px;font-weight:800;color:${totalMargin>=0?'#fbbf24':'#f87171'};margin-top:5px;">${totalMargin.toLocaleString()} ${cur()}</div></div>
+  </div>
+  <div style="background:rgba(96,165,250,.08);border:1px solid rgba(96,165,250,.2);border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:#94a3b8;">
+    ℹ️ سعر الشراء للمبيعات هو التكلفة الفعلية المسجَّلة وقت إتمام عملية البيع (Snapshot)؛ للفواتير القديمة التي سبقت تفعيل هذا التسجيل يُستخدم سعر الشراء الحالي كأفضل تقدير متاح. سعر الشراء للخدمات هو تكلفة القطع المستخدمة بطلب الخدمة.
+  </div>
+  <div class="card" style="overflow:hidden;">
+    <table>
+      <thead><tr><th>التاريخ</th><th>النوع</th><th>#</th><th>الزبون</th><th>الصنف/الخدمة</th><th>الكمية</th><th>سعر الشراء</th><th>سعر البيع</th><th>هامش الربح</th><th>الإجمالي</th></tr></thead>
+      <tbody>${rows.map(r=>`<tr>
+      <td style="font-weight:600;">${r.date}</td>
+      <td><span class="badge ${r.kind==='service'?'y':'g'}">${r.kind==='service'?'🔧 خدمة':'🛒 بيع'}</span></td>
+      <td style="color:#64748b;">${r.ref}</td>
+      <td style="color:#60a5fa;font-weight:600;">${esc(r.party)}</td>
+      <td style="color:#f1f5f9;font-weight:600;">${esc(r.desc)}</td>
+      <td style="color:#94a3b8;">${r.qty}</td>
+      <td style="color:#f87171;">${r.buyPrice.toLocaleString()} ${cur()}</td>
+      <td style="color:#52b788;">${r.sellPrice.toLocaleString()} ${cur()}</td>
+      <td style="font-weight:700;color:${r.margin>=0?'#fbbf24':'#f87171'};">${r.margin.toLocaleString()} ${cur()}</td>
+      <td style="font-weight:700;">${r.total.toLocaleString()} ${cur()}</td>
+      </tr>`).join('') || '<tr><td colspan="10" style="text-align:center;color:#475569;padding:20px;">لا توجد بيانات ضمن هذه الفلترة</td></tr>'}
+      </tbody>
+    </table>
+  </div>`;
+};
+
+
 window.renderExpensesReport = function(){
   const el = document.getElementById('expenses-rep-body');
   if(!el) return;
@@ -4711,14 +4982,15 @@ window.renderExpensesReport = function(){
 
   <div class="card" style="overflow:hidden;">
     <table>
-      <thead><tr><th>التاريخ</th><th>التصنيف</th><th>الوصف</th><th>المبلغ</th><th>طريقة الدفع</th></tr></thead>
+      <thead><tr><th>التاريخ</th><th>التصنيف</th><th>الوصف</th><th>الموظف</th><th>المبلغ</th><th>طريقة الدفع</th></tr></thead>
       <tbody>${list.map(e=>`<tr>
       <td style="font-weight:600;">${e.date}</td>
       <td><span class="badge b">${e.category_icon||'📦'} ${esc(e.category_name)||'—'}</span></td>
       <td style="color:#f1f5f9;">${esc(e.description)}</td>
+      <td style="color:#60a5fa;">${e.employee_name?'👤 '+esc(e.employee_name):'—'}</td>
       <td style="font-weight:700;color:#f87171;">${(e.amount||0).toLocaleString()} ${cur()}</td>
       <td>${e.payment_method}</td>
-      </tr>`).join('') || '<tr><td colspan="5" style="text-align:center;color:#475569;padding:20px;">لا توجد مصاريف ضمن هذه الفلترة</td></tr>'}
+      </tr>`).join('') || '<tr><td colspan="6" style="text-align:center;color:#475569;padding:20px;">لا توجد مصاريف ضمن هذه الفلترة</td></tr>'}
       </tbody>
     </table>
   </div>`;
@@ -6498,6 +6770,12 @@ function expenseFormModal(item){
     <div style="grid-column:span 2;"><label class="lbl">الوصف <span style="color:#f87171;">*</span></label>
       <input class="inp" id="ef-desc" placeholder="مثال: صيانة سيارة التوصيل..." value="${esc(item.description)||''}"/>
     </div>
+    <div style="grid-column:span 2;"><label class="lbl">🔗 ربط بموظف (اختياري — لعمليات السلف/الرواتب اليدوية)</label>
+      <select class="inp" id="ef-employee">
+        <option value="">-- بدون ربط --</option>
+        ${employees.map(emp=>`<option value="${emp.id}"${item.employee_id===emp.id?' selected':''}>${esc(emp.name)}${emp.position?' — '+esc(emp.position):''}</option>`).join('')}
+      </select>
+    </div>
     <div><label class="lbl">التاريخ</label>
       <input class="inp" type="date" id="ef-date" value="${item.date||today}"/>
     </div>
@@ -7764,6 +8042,7 @@ function bindModal(){
       const body = {
         category_id: category_id?parseInt(category_id):null, description, amount, date,
         payment_method: method,
+        employee_id: document.getElementById('ef-employee')?.value ? parseInt(document.getElementById('ef-employee').value) : null,
         cheque_no: document.getElementById('ef-cheque-no')?.value||'',
         cheque_date: document.getElementById('ef-cheque-date')?.value||'',
         cheque_bank: document.getElementById('ef-cheque-bank')?.value||'',
@@ -8076,6 +8355,7 @@ function bindPage(){
 // يُستدعى بعد إدراج HTML أي تبويب تقرير، لتفعيل الحساب/الرسم الديناميكي للتبويبات التي تحتاج ذلك
 function afterRepRender(type){
   if(type==='sales') renderSalesReport();
+  if(type==='detailed') renderDetailedReport();
   if(type==='top-products') renderTopProducts();
   if(type==='sup-compare') renderSupplierCompare();
   if(type==='expenses-report') renderExpensesReport();
