@@ -4438,7 +4438,7 @@ function reportsHTML(){
     <div class="stat"><div style="font-size:13px;color:#64748b;">الربح الصافي</div><div style="font-size:19px;font-weight:800;color:#fbbf24;margin-top:7px;">${(ts-tp-te).toLocaleString()} ${cur()}</div></div>
   </div>
   <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;" id="rep-tabs">
-    ${[['sales','المبيعات'],['detailed','التفصيلي (شراء/بيع/خدمة) 🧾'],['top-products','الأكثر/الأقل مبيعاً 📈'],['purchases','المشتريات'],['expenses-report','المصاريف 💸'],['sup-compare','مقارنة أسعار الموردين ⚖️'],['cheques','الشيكات 🏦'],['sup-detail','كشف مورد 🔍'],['cust-detail','كشف زبون 🔍'],['customers','ملخص الزبائن'],['inventory','المخزون']
+    ${[['sales','المبيعات'],['detailed','التفصيلي (شراء/بيع/خدمة) 🧾'],['top-products','الأكثر/الأقل مبيعاً 📈'],['purchases','المشتريات'],['expenses-report','المصاريف 💸'],['sup-compare','مقارنة أسعار الموردين ⚖️'],['cheques','الشيكات 🏦'],['sup-detail','كشف مورد 🔍'],['cust-detail','كشف زبون 🔍'],['customers','ملخص الزبائن'],['suppliers-summary','ملخص الموردين'],['inventory','المخزون']
     ].map(([id,label],i)=>`<button class="btn ${i===0?'p':'s'}" data-rep="${id}">${label}</button>`).join('')}
   </div>
   <div id="rc">${repContent('sales')}</div>`;
@@ -4525,7 +4525,7 @@ function repContent(type){
     <div id="sup-compare-body"><div class="spin"></div></div>`;
   }
 
-  if(type==='purchases') return `<div class="card"><table>
+  if(type==='purchases') return printPdfToolbar('rep-purchases','تقرير المشتريات') + `<div id="rep-purchases"><div class="card"><table>
     <thead><tr><th>#</th><th>التاريخ</th><th>المورد</th><th>الاصناف</th><th>الاجمالي</th><th>المدفوع</th><th>المتبقي</th><th>الحالة</th><th>إجراءات</th></tr></thead>
     <tbody>${purchases.map(p=>{
       const paidAmt = (p.paid || 0);
@@ -4546,11 +4546,12 @@ function repContent(type){
     </tr>`;}).join('')||'<tr><td colspan="9" style="text-align:center;color:#475569;padding:20px;">لا توجد مشتريات</td></tr>'}
     </tbody></table>
     <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:14px;border-top:1px solid #1e2537;">
+
       <div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">إجمالي المشتريات</div><div style="font-size:16px;font-weight:800;color:#60a5fa;margin-top:5px;">${purchases.reduce((s,p)=>s+(p.total||0),0).toLocaleString()} ${cur()}</div></div>
       <div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">إجمالي المدفوع</div><div style="font-size:16px;font-weight:800;color:#52b788;margin-top:5px;">${purchases.reduce((s,p)=>s+(p.paid||0),0).toLocaleString()} ${cur()}</div></div>
       <div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">إجمالي المتبقي</div><div style="font-size:16px;font-weight:800;color:#f87171;margin-top:5px;">${purchases.reduce((s,p)=>s+Math.max(0,(p.total||0)-(p.paid||0)),0).toLocaleString()} ${cur()}</div></div>
     </div>
-    </div>`;
+    </div></div>`;
 
   if(type==='sup-detail'){
     const today=new Date().toISOString().slice(0,10);
@@ -4599,8 +4600,8 @@ function repContent(type){
     + '</div>';
   }
 
-  if(type==='customers') return `<div class="card"><table>
-    <thead><tr><th>الزبون</th><th>المدينة</th><th>الطلبات</th><th>الاجمالي</th><th>المدفوع</th><th>المتبقي</th><th>إجراءات</th></tr></thead>
+  if(type==='customers') return printPdfToolbar('rep-cust-summary','ملخص حسابات الزبائن') + `<div id="rep-cust-summary"><div class="card"><table>
+    <thead><tr><th>الزبون</th><th>رقم الهاتف</th><th>المدينة</th><th>الطلبات</th><th>الاجمالي</th><th>المدفوع</th><th>المتبقي</th><th>إجراءات</th></tr></thead>
     <tbody>${customers.map(c=>{
       const o=sales.filter(s=>parseInt(s.customer_id)===c.id);
       const svcs=serviceOrders.filter(so=>parseInt(so.customer_id)===c.id);
@@ -4610,6 +4611,7 @@ function repContent(type){
       const totalRem   = customerReceivable(c.id);
       return `<tr>
       <td style="font-weight:700;color:#f1f5f9;">${esc(c.name)}</td>
+      <td style="color:#60a5fa;font-family:monospace;">${esc(c.phone)||'—'}</td>
       <td>${esc(c.city)||''}</td>
       <td><span class="badge b">${o.length+svcs.length}</span>${svcs.length?`<span class="badge y" style="font-size:10px;margin-right:3px;">🔧${svcs.length}</span>`:''}</td>
       <td style="font-weight:700;">${totalSales.toLocaleString()} ${cur()}</td>
@@ -4618,16 +4620,44 @@ function repContent(type){
       <td><div style="display:flex;gap:4px;">
         <button class="btn p" style="padding:3px 8px;font-size:11px;" onclick="doCustReport(${c.id})">📋 كشف حساب</button>
       </div></td>
-      </tr>`;}).join('')||'<tr><td colspan="7" style="text-align:center;color:#475569;padding:20px;">لا يوجد زبائن</td></tr>'}
+      </tr>`;}).join('')||'<tr><td colspan="8" style="text-align:center;color:#475569;padding:20px;">لا يوجد زبائن</td></tr>'}
     </tbody></table>
     <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:14px;border-top:1px solid #1e2537;">
       <div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">إجمالي المبيعات والخدمات</div><div style="font-size:16px;font-weight:800;color:#52b788;margin-top:5px;">${(sales.reduce((s,x)=>s+(x.total||0),0)+serviceOrders.reduce((s,x)=>s+(x.service_fee||0),0)).toLocaleString()} ${cur()}</div></div>
       <div style="text-align:center;" class="stat"><div style="font-size:11px;color:#64748b;">إجمالي المدفوع</div><div style="font-size:16px;font-weight:800;color:#60a5fa;margin-top:5px;">${(sales.reduce((s,x)=>s+(x.paid||0),0)+serviceOrders.reduce((s,x)=>s+(x.paid||0),0)+accountPayments.filter(p=>p.party_type==='customer').reduce((s,x)=>s+(x.amount||0),0)).toLocaleString()} ${cur()}</div></div>
       <div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">إجمالي المتبقي</div><div style="font-size:16px;font-weight:800;color:#fbbf24;margin-top:5px;">${customers.reduce((s,c)=>s+customerReceivable(c.id),0).toLocaleString()} ${cur()}</div></div>
     </div>
-    </div>`;
+    </div></div>`;
 
-  if(type==='inventory') return `<div class="card"><table>
+  if(type==='suppliers-summary') return printPdfToolbar('rep-sup-summary','ملخص حسابات الموردين') + `<div id="rep-sup-summary"><div class="card"><table>
+    <thead><tr><th>المورد</th><th>رقم الهاتف</th><th>المدينة</th><th>عدد الفواتير</th><th>الاجمالي</th><th>المدفوع</th><th>المتبقي (مستحق)</th><th>إجراءات</th></tr></thead>
+    <tbody>${suppliers.map(s=>{
+      const purList = purchases.filter(p=>parseInt(p.supplier_id)===s.id && p.status!=='مردود');
+      const accPaid = supplierAccountPaid(s.id);
+      const totalPur  = purList.reduce((t,p)=>t+(p.total||0),0);
+      const totalPaid = purList.reduce((t,p)=>t+(p.paid||0),0) + accPaid;
+      const totalRem  = supplierPayable(s.id);
+      return `<tr>
+      <td style="font-weight:700;color:#f1f5f9;">${esc(s.name)}</td>
+      <td style="color:#60a5fa;font-family:monospace;">${esc(s.phone)||'—'}</td>
+      <td>${esc(s.city)||''}</td>
+      <td><span class="badge b">${purList.length}</span></td>
+      <td style="font-weight:700;">${totalPur.toLocaleString()} ${cur()}</td>
+      <td style="color:#52b788;font-weight:600;">${totalPaid.toLocaleString()} ${cur()}${accPaid>0?`<div style="font-size:10px;color:#94a3b8;">منها ${accPaid.toLocaleString()} على الحساب</div>`:''}</td>
+      <td style="color:${totalRem>0?'#f87171':'#52b788'};font-weight:700;">${totalRem.toLocaleString()} ${cur()}</td>
+      <td><div style="display:flex;gap:4px;">
+        <button class="btn p" style="padding:3px 8px;font-size:11px;" onclick="doSupReport(${s.id})">📋 كشف حساب</button>
+      </div></td>
+      </tr>`;}).join('')||'<tr><td colspan="8" style="text-align:center;color:#475569;padding:20px;">لا يوجد موردون</td></tr>'}
+    </tbody></table>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:14px;border-top:1px solid #1e2537;">
+      <div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">إجمالي المشتريات</div><div style="font-size:16px;font-weight:800;color:#60a5fa;margin-top:5px;">${purchases.filter(p=>p.status!=='مردود').reduce((s,x)=>s+(x.total||0),0).toLocaleString()} ${cur()}</div></div>
+      <div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">إجمالي المدفوع</div><div style="font-size:16px;font-weight:800;color:#52b788;margin-top:5px;">${(purchases.filter(p=>p.status!=='مردود').reduce((s,x)=>s+(x.paid||0),0)+accountPayments.filter(p=>p.party_type==='supplier').reduce((s,x)=>s+(x.amount||0),0)).toLocaleString()} ${cur()}</div></div>
+      <div class="stat" style="text-align:center;"><div style="font-size:11px;color:#64748b;">إجمالي المستحق</div><div style="font-size:16px;font-weight:800;color:#f87171;margin-top:5px;">${suppliers.reduce((s,x)=>s+supplierPayable(x.id),0).toLocaleString()} ${cur()}</div></div>
+    </div>
+    </div></div>`;
+
+  if(type==='inventory') return printPdfToolbar('rep-inventory','تقرير المخزون') + `<div id="rep-inventory"><div class="card"><table>
     <thead><tr><th>المنتج</th><th>الفئة</th><th>المخزون</th><th>القيمة</th><th>الحالة</th></tr></thead>
     <tbody>${products.map(p=>`<tr>
     <td style="font-weight:700;color:#f1f5f9;">${p.name}</td>
@@ -4635,7 +4665,7 @@ function repContent(type){
     <td><span class="badge ${p.stock<lowStockLimit()?'r':'g'}">${p.stock}</span></td>
     <td style="color:#52b788;font-weight:600;">${(p.stock*p.buy_price).toLocaleString()} ${cur()}</td>
     <td><span class="badge ${p.stock===0?'r':p.stock<lowStockLimit()?'y':'g'}">${p.stock===0?'نفد':p.stock<lowStockLimit()?'منخفض':'متوفر'}</span></td></tr>`).join('')}
-    </tbody></table></div>`;
+    </tbody></table></div></div>`;
 
   if(type==='expenses-report'){
     const today = new Date().toISOString().slice(0,10);
@@ -4735,7 +4765,7 @@ window.renderSalesReport = function(){
   const totalProfit  = withMargin.reduce((t,s)=>t+s._profit,0);
   const avgInvoice   = withMargin.length ? totalRevenue/withMargin.length : 0;
 
-  el.innerHTML = `
+  el.innerHTML = printPdfToolbar('sales-rep-print','تقرير المبيعات') + `<div id="sales-rep-print">
   <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px;">
     <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">عدد الفواتير</div><div style="font-size:18px;font-weight:800;color:#60a5fa;margin-top:5px;">${withMargin.length}</div></div>
     <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">إجمالي المبيعات</div><div style="font-size:18px;font-weight:800;color:#52b788;margin-top:5px;">${totalRevenue.toLocaleString()} ${cur()}</div></div>
@@ -4773,7 +4803,7 @@ window.renderSalesReport = function(){
       </tr>`).join('') || '<tr><td colspan="8" style="text-align:center;color:#475569;padding:20px;">لا توجد مبيعات ضمن هذه الفلترة</td></tr>'}
       </tbody>
     </table>
-  </div>`;
+  </div></div>`;
 };
 
 // رسم بياني بسيط بالأعمدة (بدون أي مكتبة خارجية) — يجمّع المبيعات حسب يوم/أسبوع/شهر
@@ -4903,7 +4933,7 @@ window.renderDetailedReport = function(){
   const totalMargin = rows.reduce((s,r)=>s+r.margin,0);
   const custObj     = custId ? customers.find(c=>c.id===custId) : null;
 
-  el.innerHTML = `
+  el.innerHTML = printPdfToolbar('detailed-rep-print','التقرير التفصيلي (شراء/بيع/خدمة)') + `<div id="detailed-rep-print">
   ${custObj?`<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
     <span class="badge b" style="font-size:12px;padding:6px 12px;">👤 مفلتَر حسب: ${esc(custObj.name)}</span>
     <button class="btn s" style="padding:3px 10px;font-size:11px;" onclick="drepPickCustomer('','');renderDetailedReport();">✕ إزالة الفلتر</button>
@@ -4934,7 +4964,7 @@ window.renderDetailedReport = function(){
       </tr>`).join('') || '<tr><td colspan="10" style="text-align:center;color:#475569;padding:20px;">لا توجد بيانات ضمن هذه الفلترة</td></tr>'}
       </tbody>
     </table>
-  </div>`;
+  </div></div>`;
 };
 
 
@@ -4959,7 +4989,7 @@ window.renderExpensesReport = function(){
   const catRows = Object.entries(byCat).sort((a,b)=>b[1].total-a[1].total);
   const maxCat = Math.max(...catRows.map(([,v])=>v.total), 1);
 
-  el.innerHTML = `
+  el.innerHTML = printPdfToolbar('expenses-rep-print','تقرير المصاريف') + `<div id="expenses-rep-print">
   <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px;">
     <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">عدد المصاريف</div><div style="font-size:18px;font-weight:800;color:#60a5fa;margin-top:5px;">${list.length}</div></div>
     <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">إجمالي المصاريف</div><div style="font-size:18px;font-weight:800;color:#f87171;margin-top:5px;">${total.toLocaleString()} ${cur()}</div></div>
@@ -4993,7 +5023,7 @@ window.renderExpensesReport = function(){
       </tr>`).join('') || '<tr><td colspan="6" style="text-align:center;color:#475569;padding:20px;">لا توجد مصاريف ضمن هذه الفلترة</td></tr>'}
       </tbody>
     </table>
-  </div>`;
+  </div></div>`;
 };
 
 // ══════════════════════════════════════════════
@@ -5024,7 +5054,7 @@ window.renderTopProducts = function(){
   const slow   = rowsArr.filter(r=>r.qty===0);
   const least10= sold.slice(-10).reverse();
 
-  el.innerHTML = `
+  el.innerHTML = printPdfToolbar('top-products-print','تقرير الأكثر/الأقل مبيعاً') + `<div id="top-products-print">
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
     <div class="card" style="padding:0;overflow:hidden;">
       <div style="background:#1a1d27;padding:12px 16px;border-bottom:1px solid #1e2537;font-weight:700;color:#52b788;">🏆 الأكثر مبيعاً (أعلى 10)</div>
@@ -5047,7 +5077,7 @@ window.renderTopProducts = function(){
       </tbody></table>
       ${slow.length ? `<div style="padding:10px 16px;border-top:1px solid #1e2537;font-size:12px;color:#f87171;">⚠️ ${slow.length} منتج لم يُبَع إطلاقاً ضمن هذه الفترة</div>` : ''}
     </div>
-  </div>`;
+  </div></div>`;
 };
 
 // ══════════════════════════════════════════════
@@ -5175,7 +5205,7 @@ window.renderSupplierCompare = function(){
       el.innerHTML = '<div class="card" style="padding:24px;text-align:center;color:#64748b;">لا يوجد سجل شراء لهذا المنتج بعد</div>';
       return;
     }
-    el.innerHTML = supplierCompareTableHTML(product, rowsArr);
+    el.innerHTML = printPdfToolbar('sup-compare-print','مقارنة أسعار الموردين') + `<div id="sup-compare-print">${supplierCompareTableHTML(product, rowsArr)}</div>`;
     return;
   }
 
@@ -5188,44 +5218,58 @@ window.renderSupplierCompare = function(){
     el.innerHTML = '<div class="card" style="padding:24px;text-align:center;color:#64748b;">لا توجد منتجات اشتُريت من أكثر من مورد بعد لعرض مقارنة</div>';
     return;
   }
-  el.innerHTML = multiSupplierProducts.map(x=>supplierCompareTableHTML(x.product, x.rowsArr)).join('');
+  el.innerHTML = printPdfToolbar('sup-compare-print','مقارنة أسعار الموردين') + `<div id="sup-compare-print">${multiSupplierProducts.map(x=>supplierCompareTableHTML(x.product, x.rowsArr)).join('')}</div>`;
 };
 
 // دالة كشف المورد - تُستدعى مباشرة من onclick في الزر
-window.doSupReport = async function(){
-  const supSel = document.getElementById('srid');
-  const fromEl = document.getElementById('srf');
-  const toEl   = document.getElementById('srt');
-  const resEl  = document.getElementById('srr');
-  
-  if(!supSel || !supSel.value){
-    alert('يرجى اختيار المورد أولاً');
-    if(supSel) supSel.focus();
-    return;
+window.doSupReport = async function(supIdDirect){
+  // يمكن استدعاؤها من زر في جدول ملخص الموردين بـ id مباشر
+  let supId, dateFrom, dateTo, resEl, btn;
+
+  if(supIdDirect){
+    // استدعاء من تقرير ملخص الموردين (جدول ملخص)
+    supId    = supIdDirect;
+    dateFrom = '2000-01-01';
+    dateTo   = '2099-12-31';
+    const rc = document.getElementById('rc');
+    if(rc){
+      rc.innerHTML = '<div style="text-align:center;padding:30px;"><div class="spin"></div></div>';
+      resEl = rc;
+    }
+  } else {
+    // استدعاء من نموذج البحث
+    const supSel = document.getElementById('srid');
+    const fromEl = document.getElementById('srf');
+    const toEl   = document.getElementById('srt');
+    resEl = document.getElementById('srr');
+    btn   = document.getElementById('srb');
+
+    if(!supSel || !supSel.value){
+      alert('يرجى اختيار المورد أولاً');
+      if(supSel) supSel.focus();
+      return;
+    }
+
+    supId    = supSel.value;
+    dateFrom = fromEl ? fromEl.value : '2000-01-01';
+    dateTo   = toEl   ? toEl.value   : '2099-12-31';
+
+    // إظهار مؤشر التحميل
+    if(resEl){
+      resEl.innerHTML = '<div style="text-align:center;padding:30px;">'
+        + '<div class="spin"></div>'
+        + '<div style="color:#64748b;margin-top:10px;font-size:13px;">جاري تحميل الكشف...</div>'
+        + '</div>';
+    }
+    if(btn){ btn.disabled=true; btn.textContent='جاري التحميل...'; }
   }
-  
-  const supId   = supSel.value;
-  const dateFrom = fromEl ? fromEl.value : '2000-01-01';
-  const dateTo   = toEl   ? toEl.value   : '2099-12-31';
-  
-  // إظهار مؤشر التحميل
-  if(resEl){
-    resEl.innerHTML = '<div style="text-align:center;padding:30px;">'
-      + '<div class="spin"></div>'
-      + '<div style="color:#64748b;margin-top:10px;font-size:13px;">جاري تحميل الكشف...</div>'
-      + '</div>';
-  }
-  
-  // تعطيل الزر مؤقتاً
-  const btn = document.getElementById('srb');
-  if(btn){ btn.disabled=true; btn.textContent='جاري التحميل...'; }
-  
+
   try{
     const url = '/api/reports/supplier?supplier_id='+supId+'&date_from='+dateFrom+'&date_to='+dateTo;
     const data = await api('GET', url);
-    
+
     if(resEl) resEl.innerHTML = supRepHTML(data);
-    
+
     // تمرير للنتائج
     setTimeout(()=>{
       if(resEl) resEl.scrollIntoView({behavior:'smooth', block:'start'});
@@ -5463,9 +5507,10 @@ function custRepHTML(d){
     </div>
   </div>`:''}
   </div>
-  <div style="display:flex;gap:10px;margin-top:14px;">
+  <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap;">
     <button class="btn p" onclick="doPrint()">🖨️ طباعة</button>
     <button class="btn s" onclick="doPDF()">📄 تصدير PDF</button>
+    <button class="btn s" onclick='exportCustomerExcel(${JSON.stringify(d).replace(/'/g,"&#39;")})'>📊 تصدير Excel</button>
     <button class="btn s" onclick="copyCustomerStatement(${c.id})">📋 نسخ كشف الحساب (واتساب)</button>
   </div>`;
 }
@@ -5629,8 +5674,51 @@ window.exportSupplierExcel = function(d){
   XLSX.writeFile(wb, `كشف_حساب_${s.name}_${d.date_from}_${d.date_to}.xlsx`);
 };
 
-function printWrap(html){
+// تصدير كشف حساب زبون (مبيعات + خدمات) إلى ملف Excel بنفس أسلوب كشف حساب المورد
+window.exportCustomerExcel = function(d){
+  if(typeof XLSX === 'undefined'){
+    alert('تعذر تحميل مكتبة تصدير Excel — تأكد من الاتصال بالإنترنت وأعد المحاولة');
+    return;
+  }
+  const c = d.customer;
+  const txRows = (d.transactions||[]).map(t=>({
+    'النوع': t.kind==='service' ? ('خدمة — '+(t.service_type||'')) : 'بيع',
+    'رقم': t.id,
+    'التاريخ': t.date,
+    'الإجمالي': t.total,
+    'المدفوع': t.paid||0,
+    'المتبقي': t.remaining||0,
+    'الحالة': t.status
+  }));
+  const paymentRows = (d.all_payments||[]).map(pay=>({
+    'التاريخ': pay.date,
+    'الفاتورة': pay.ref_id,
+    'الطريقة': pay.method,
+    'المبلغ': pay.amount,
+    'رقم الشيك': pay.cheque_no||'',
+    'البنك': pay.cheque_bank||'',
+    'ملاحظات': pay.notes||''
+  }));
+  const summaryRows = [
+    {'البيان':'اسم الزبون','القيمة':c.name},
+    {'البيان':'رقم الهاتف','القيمة':c.phone||''},
+    {'البيان':'الفترة','القيمة': d.date_from+' الى '+d.date_to},
+    {'البيان':'عدد العمليات','القيمة': d.count},
+    {'البيان':'الإجمالي (مبيعات + خدمات)','القيمة': d.total},
+    {'البيان':'إجمالي المدفوع','القيمة': d.total_paid},
+    {'البيان':'المتبقي (مستحق)','القيمة': d.total_remaining},
+  ];
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), 'ملخص');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(txRows), 'العمليات');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(paymentRows), 'الدفعات');
+  XLSX.writeFile(wb, `كشف_حساب_${c.name}_${d.date_from}_${d.date_to}.xlsx`);
+};
+
+function printWrap(html, title){
   return `<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8">
+  <title>${title||'طباعة'}</title>
   <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;800&display=swap" rel="stylesheet">
   <style>*{font-family:'Tajawal',sans-serif;box-sizing:border-box}body{background:#fff;color:#111;padding:20px;direction:rtl}
   table{width:100%;border-collapse:collapse;margin-bottom:10px}
@@ -5638,23 +5726,72 @@ function printWrap(html){
   td{padding:6px 8px;border:1px solid #ddd;font-size:13px}
   .card{border:1px solid #ddd;border-radius:6px;margin-bottom:10px;overflow:hidden}
   .stat{border:1px solid #ddd;border-radius:6px;padding:10px}
+  .print-toolbar{display:none !important}
+  h2.print-title{font-size:18px;font-weight:800;margin-bottom:14px;border-bottom:2px solid #2d6a4f;padding-bottom:8px;}
   @page{size:A4;margin:12mm}
   </style></head><body>
+  ${title?`<h2 class="print-title">${title} — ${(sysSettings.system_name||'')}</h2>`:''}
   ${html.replace(/class="badge [^"]*"/g,'style="font-weight:bold"').replace(/onclick="[^"]*"/g,'').replace(/id="[^"]*"/g,'')}
   </body></html>`;
 }
-window.doPrint=function(){
-  const a=document.getElementById('spa');if(!a)return;
+
+// طباعة أي قسم بالصفحة عبر معرفه — تُستخدم لكل الكشوفات والتقارير
+window.printSection = function(elId, title){
+  const a=document.getElementById(elId); if(!a){ alert('لا يوجد محتوى لطباعته'); return; }
   const w=window.open('','_blank','width=900,height=700');
-  w.document.write(printWrap(a.innerHTML));
+  w.document.write(printWrap(a.innerHTML, title));
   w.document.close(); setTimeout(()=>w.print(),700);
 };
-window.doPDF=function(){
-  const a=document.getElementById('spa');if(!a)return;
+// تصدير أي قسم بالصفحة كملف PDF (عبر نافذة طباعة المتصفح — "حفظ كـ PDF")
+window.pdfSection = function(elId, title){
+  const a=document.getElementById(elId); if(!a){ alert('لا يوجد محتوى لتصديره'); return; }
   const w=window.open('','_blank','width=900,height=700');
-  const html=printWrap(a.innerHTML).replace('<body>','<body onload="window.print()">');
+  const html=printWrap(a.innerHTML, title).replace('<body>','<body onload="window.print()">');
   w.document.write(html); w.document.close();
 };
+
+// أسماء قديمة للتوافق (كشف حساب مورد/زبون المفرد يستخدم عنصر #spa)
+window.doPrint=function(){ printSection('spa'); };
+window.doPDF=function(){ pdfSection('spa'); };
+
+// شريط أزرار طباعة/PDF جاهز لإضافته أعلى أي تقرير أو كشف
+// تصدير أي قسم بالصفحة (يحتوي جدول أو أكثر) كملف Excel حقيقي (.xlsx عبر SheetJS)
+window.exportExcelSection = function(elId, title){
+  if(typeof XLSX === 'undefined'){
+    alert('تعذّر تحميل مكتبة تصدير Excel — تأكد من الاتصال بالإنترنت وأعد المحاولة');
+    return;
+  }
+  const container = document.getElementById(elId);
+  if(!container){ alert('لا يوجد محتوى لتصديره'); return; }
+  const tables = container.querySelectorAll('table');
+  if(!tables.length){ alert('لا يوجد جدول بيانات لتصديره'); return; }
+  const wb = XLSX.utils.book_new();
+  tables.forEach((t,i)=>{
+    // نسخة مؤقتة من الجدول لحذف أعمدة الأزرار التفاعلية (إجراءات/تعديل الحالة) قبل التصدير — لا تؤثر على الجدول المعروض بالصفحة
+    const clone = t.cloneNode(true);
+    const ACTION_HEADERS = ['إجراءات','تعديل الحالة'];
+    let actionColIdx = -1;
+    clone.querySelectorAll('thead th').forEach((th,idx)=>{ if(ACTION_HEADERS.includes(th.textContent.trim())) actionColIdx = idx; });
+    if(actionColIdx > -1){
+      clone.querySelectorAll('tr').forEach(row=>{ row.children[actionColIdx]?.remove(); });
+    }
+    const ws = XLSX.utils.table_to_sheet(clone);
+    const sheetName = (tables.length>1 ? `جدول ${i+1}` : (title||'البيانات')).slice(0,31);
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+  });
+  const safeName = (title||'تقرير').replace(/[\\/:*?"<>|]/g,'_');
+  const today = new Date().toISOString().slice(0,10);
+  XLSX.writeFile(wb, `${safeName}_${today}.xlsx`);
+};
+
+function printPdfToolbar(elId, title){
+  const safeTitle = (title||'').replace(/'/g,"\\'");
+  return `<div style="display:flex;gap:8px;margin-bottom:12px;">
+    <button class="btn p" onclick="printSection('${elId}','${safeTitle}')">🖨️ طباعة</button>
+    <button class="btn s" onclick="pdfSection('${elId}','${safeTitle}')">📄 تصدير PDF</button>
+    <button class="btn s" onclick="exportExcelSection('${elId}','${safeTitle}')">📊 تصدير Excel</button>
+  </div>`;
+}
 
 // ── إضافة زبون سريع من POS ──
 window.openQuickCustomer = function(){
@@ -9598,6 +9735,8 @@ function chequesHTML(d){
       <div style="font-size:14px;font-weight:800;color:#f1f5f9;">📋 تفاصيل الشيكات — ${date_from} إلى ${date_to}</div>
       <div style="display:flex;gap:8px;">
         <button class="btn s" style="padding:4px 12px;font-size:12px;" onclick="printCheques()">🖨️ طباعة</button>
+        <button class="btn s" style="padding:4px 12px;font-size:12px;" onclick="pdfCheques()">📄 تصدير PDF</button>
+        <button class="btn s" style="padding:4px 12px;font-size:12px;" onclick="exportExcelSection('chq-table-wrap','تقرير الشيكات')">📊 تصدير Excel</button>
       </div>
     </div>
     <table>
@@ -9700,17 +9839,32 @@ window.chqOpenUpdate = async function(id){
   }
 };
 
-window.printCheques = function(){
-  const el = document.getElementById('chq-table-wrap');
-  if(!el) return;
-  const w = window.open('','_blank','width=1000,height=700');
-  w.document.write(`<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8">
+function chequesPrintWrap(html, autoPrint){
+  return `<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8">
+  <title>تقرير الشيكات</title>
   <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;800&display=swap" rel="stylesheet">
   <style>*{font-family:'Tajawal',sans-serif;box-sizing:border-box}body{padding:20px;color:#111;direction:rtl}
   table{width:100%;border-collapse:collapse}th{background:#e8f5e9;padding:7px 9px;text-align:right;border:1px solid #aaa;font-size:12px}
   td{padding:6px 8px;border:1px solid #ddd;font-size:12px}
+  h2{font-size:17px;font-weight:800;margin-bottom:12px;border-bottom:2px solid #2d6a4f;padding-bottom:6px;}
   @page{size:A4 landscape;margin:10mm}</style></head>
-  <body onload="window.print()">${el.innerHTML}</body></html>`);
+  <body${autoPrint?' onload="window.print()"':''}>
+  <h2>تقرير الشيكات — ${(sysSettings.system_name||'')}</h2>
+  ${html.replace(/onclick="[^"]*"/g,'')}
+  </body></html>`;
+}
+window.printCheques = function(){
+  const el = document.getElementById('chq-table-wrap');
+  if(!el) return;
+  const w = window.open('','_blank','width=1000,height=700');
+  w.document.write(chequesPrintWrap(el.innerHTML, false));
+  w.document.close(); setTimeout(()=>w.print(),700);
+};
+window.pdfCheques = function(){
+  const el = document.getElementById('chq-table-wrap');
+  if(!el) return;
+  const w = window.open('','_blank','width=1000,height=700');
+  w.document.write(chequesPrintWrap(el.innerHTML, true));
   w.document.close();
 };
 
