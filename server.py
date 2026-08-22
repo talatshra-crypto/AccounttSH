@@ -98,6 +98,7 @@ def init_db():
         role TEXT DEFAULT 'user',
         is_active INTEGER DEFAULT 1,
         salt TEXT DEFAULT '',
+        permissions TEXT DEFAULT NULL,
         created_at TEXT DEFAULT(datetime('now'))
     );
     CREATE TABLE IF NOT EXISTS sessions(
@@ -370,6 +371,11 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN salt TEXT DEFAULT ''")
         c.commit()
     except: pass
+    # إضافة عمود الصلاحيات المخصصة للمستخدمين (للقواعد القديمة) — NULL يعني استخدام صلاحيات الدور الافتراضية
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN permissions TEXT DEFAULT NULL")
+        c.commit()
+    except: pass
     # إضافة أعمدة الخصم لفواتير البيع وأصنافها (للقواعد القديمة)
     try:
         c.execute("ALTER TABLE sales ADD COLUMN discount REAL DEFAULT 0")
@@ -441,7 +447,7 @@ def check_auth(req):
     token = auth[7:]
     c = get_db()
     u = row1(c.execute("""
-        SELECT u.id, u.username, u.full_name, u.role, u.is_active, u.password, u.salt,
+        SELECT u.id, u.username, u.full_name, u.role, u.is_active, u.password, u.salt, u.permissions,
                s.created_at AS session_created_at
         FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?
     """, (token,)))
@@ -462,6 +468,70 @@ def check_auth(req):
     return u
 
 # ══════════════════════════════════════════════
+#  نظام الصلاحيات المخصصة (الصفحات + تبويبات التقارير)
+# ══════════════════════════════════════════════
+ALL_PAGES = ["dashboard","products","warehouse","purchases","pos","suppliers","customers",
+             "accounting","expenses","services","quotes","reports","settings"]
+ALL_REPORT_TABS = ["sales","detailed","top-products","purchases","expenses-report","sup-compare",
+                    "cheques","sup-detail","cust-detail","customers","suppliers-summary","inventory"]
+
+DEFAULT_PAGES_BY_ROLE = {
+    "admin":   list(ALL_PAGES),
+    "user":    [p for p in ALL_PAGES if p != "settings"],
+    "cashier": ["pos","products","quotes"],
+}
+DEFAULT_REPORTS_BY_ROLE = {
+    "admin":   list(ALL_REPORT_TABS),
+    "user":    list(ALL_REPORT_TABS),
+    "cashier": [],
+}
+
+def effective_permissions(user):
+    """يرجع الصلاحيات الفعلية للمستخدم (مخصصة إن وُجدت بقاعدة البيانات، وإلا افتراضية حسب الدور)"""
+    role = (user or {}).get("role", "user")
+    raw = (user or {}).get("permissions")
+    custom = None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                custom = parsed
+        except Exception:
+            custom = None
+    pages = custom.get("pages") if custom else None
+    reports = custom.get("reports") if custom else None
+    if not isinstance(pages, list):
+        pages = DEFAULT_PAGES_BY_ROLE.get(role, DEFAULT_PAGES_BY_ROLE["user"])
+    if not isinstance(reports, list):
+        reports = DEFAULT_REPORTS_BY_ROLE.get(role, [])
+    return {"pages": pages, "reports": reports}
+
+def with_effective_permissions(row):
+    """يرفق للمستخدم (dict) صلاحياته الفعلية المحسوبة + إشارة إن كانت مخصصة يدوياً"""
+    if not row: return row
+    row = dict(row)
+    is_custom = bool(row.get("permissions"))
+    row["permissions"] = effective_permissions(row)
+    row["permissions_custom"] = is_custom
+    return row
+
+def validate_permissions_payload(payload):
+    """يتحقق من صلاحيات مُرسَلة من الواجهة قبل تخزينها؛ يرجع None إن لم تكن تخصيصاً فعلياً (استخدام افتراضي الدور)"""
+    if not payload or not isinstance(payload, dict):
+        return None
+    pages = payload.get("pages")
+    reports = payload.get("reports")
+    result = {}
+    if isinstance(pages, list):
+        result["pages"] = [p for p in pages if p in ALL_PAGES]
+    if isinstance(reports, list):
+        result["reports"] = [r for r in reports if r in ALL_REPORT_TABS]
+    return result if result else None
+
+def user_can_page(user, page):
+    return page in effective_permissions(user).get("pages", [])
+
+
 #  DAO Classes (Data Access Objects)
 # ══════════════════════════════════════════════
 class BaseDAO:
@@ -475,10 +545,10 @@ class BaseDAO:
 class UsersDAO(BaseDAO):
     @staticmethod
     def list(c):
-        return BaseDAO.rows(c.execute("SELECT id,username,full_name,role,is_active,created_at FROM users ORDER BY id"))
+        return BaseDAO.rows(c.execute("SELECT id,username,full_name,role,is_active,permissions,created_at FROM users ORDER BY id"))
     @staticmethod
     def get_by_id(c, uid):
-        return BaseDAO.row1(c.execute("SELECT id,username,full_name,role,is_active,created_at FROM users WHERE id=?", (uid,)))
+        return BaseDAO.row1(c.execute("SELECT id,username,full_name,role,is_active,permissions,created_at FROM users WHERE id=?", (uid,)))
     @staticmethod
     def get_full(c, uid):
         return BaseDAO.row1(c.execute("SELECT * FROM users WHERE id=?", (uid,)))
@@ -486,20 +556,20 @@ class UsersDAO(BaseDAO):
     def get_by_username(c, uname):
         return BaseDAO.row1(c.execute("SELECT * FROM users WHERE username=?", (uname,)))
     @staticmethod
-    def create(c, username, pw_hash, full_name, role, salt):
-        cur = c.execute("INSERT INTO users(username,password,full_name,role,is_active,salt) VALUES(?,?,?,?,1,?)",
-                        (username, pw_hash, full_name, role, salt))
+    def create(c, username, pw_hash, full_name, role, salt, permissions=None):
+        cur = c.execute("INSERT INTO users(username,password,full_name,role,is_active,salt,permissions) VALUES(?,?,?,?,1,?,?)",
+                        (username, pw_hash, full_name, role, salt, permissions))
         return cur.lastrowid
     @staticmethod
-    def update(c, uid, full_name, role, is_active):
-        c.execute("UPDATE users SET full_name=?,role=?,is_active=? WHERE id=?", (full_name, role, is_active, uid))
+    def update(c, uid, full_name, role, is_active, permissions=None):
+        c.execute("UPDATE users SET full_name=?,role=?,is_active=?,permissions=? WHERE id=?", (full_name, role, is_active, permissions, uid))
     @staticmethod
     def update_password(c, uid, pw_hash, salt):
         c.execute("UPDATE users SET password=?,salt=? WHERE id=?", (pw_hash, salt, uid))
     @staticmethod
-    def update_with_password(c, uid, full_name, role, is_active, pw_hash, salt):
-        c.execute("UPDATE users SET full_name=?,role=?,is_active=?,password=?,salt=? WHERE id=?",
-                  (full_name, role, is_active, pw_hash, salt, uid))
+    def update_with_password(c, uid, full_name, role, is_active, pw_hash, salt, permissions=None):
+        c.execute("UPDATE users SET full_name=?,role=?,is_active=?,password=?,salt=?,permissions=? WHERE id=?",
+                  (full_name, role, is_active, pw_hash, salt, permissions, uid))
     @staticmethod
     def delete(c, uid):
         c.execute("DELETE FROM users WHERE id=?", (uid,))
@@ -1454,7 +1524,8 @@ def handle_api(method, path, body, req):
         clear_login_attempts(ip, uname)
         return 200, {"access_token": token, "token_type": "bearer",
                      "user": {"id":user["id"],"username":user["username"],
-                              "full_name":user["full_name"],"role":user["role"],"is_active":1}}
+                              "full_name":user["full_name"],"role":user["role"],"is_active":1,
+                              "permissions": effective_permissions(user)}}
 
     if len(parts) >= 3 and parts[1] == "auth" and parts[2] == "logout":
         auth = req.headers.get("Authorization", "")
@@ -1468,7 +1539,8 @@ def handle_api(method, path, body, req):
         u = check_auth(req)
         if not u: return 401, {"detail":"غير مصرح"}
         return 200, {"id":u["id"],"username":u["username"],
-                     "full_name":u["full_name"],"role":u["role"],"is_active":1}
+                     "full_name":u["full_name"],"role":u["role"],"is_active":1,
+                     "permissions": effective_permissions(u)}
 
     # ── AUTH change-password (self) ──
     if len(parts) >= 3 and parts[1] == "auth" and parts[2] == "change-password":
@@ -1497,7 +1569,8 @@ def handle_api(method, path, body, req):
         if u["role"] != "admin":
             c.close(); return 403, {"detail":"غير مصرح — فقط للمدير"}
         if method == "GET" and len(parts) == 2:
-            r = UsersDAO.list(c); c.close(); return 200, r
+            r = [with_effective_permissions(x) for x in UsersDAO.list(c)]
+            c.close(); return 200, r
         if method == "POST":
             uname = body.get("username","").strip()
             pw    = body.get("password","").strip()
@@ -1509,11 +1582,13 @@ def handle_api(method, path, body, req):
                 c.close(); return 400, {"detail":"كلمة المرور 4 أحرف على الأقل"}
             if role not in ("admin","user","cashier"):
                 role = "user"
+            perm_obj = validate_permissions_payload(body.get("permissions"))
+            perm_json = json.dumps(perm_obj, ensure_ascii=False) if perm_obj else None
             try:
                 salt, pw_hash = hash_password(pw)
-                uid = UsersDAO.create(c, uname, pw_hash, fname, role, salt)
+                uid = UsersDAO.create(c, uname, pw_hash, fname, role, salt, perm_json)
                 c.commit()
-                r = UsersDAO.get_by_id(c, uid)
+                r = with_effective_permissions(UsersDAO.get_by_id(c, uid))
                 c.close(); return 201, r
             except Exception as ex:
                 c.close(); return 400, {"detail":"اسم المستخدم موجود مسبقاً"}
@@ -1523,17 +1598,19 @@ def handle_api(method, path, body, req):
             role  = body.get("role","user")
             active= int(body.get("is_active", 1))
             if role not in ("admin","user","cashier"): role = "user"
+            perm_obj = validate_permissions_payload(body.get("permissions"))
+            perm_json = json.dumps(perm_obj, ensure_ascii=False) if perm_obj else None
             new_pw = body.get("password","").strip()
             if new_pw:
                 if len(new_pw) < 4:
                     c.close(); return 400, {"detail":"كلمة المرور 4 أحرف على الأقل"}
                 salt, new_hash = hash_password(new_pw)
-                UsersDAO.update_with_password(c, uid, fname, role, active, new_hash, salt)
+                UsersDAO.update_with_password(c, uid, fname, role, active, new_hash, salt, perm_json)
                 SessionsDAO.delete_by_user(c, uid)
             else:
-                UsersDAO.update(c, uid, fname, role, active)
+                UsersDAO.update(c, uid, fname, role, active, perm_json)
             c.commit()
-            r = UsersDAO.get_by_id(c, uid)
+            r = with_effective_permissions(UsersDAO.get_by_id(c, uid))
             c.close(); return 200, r
         if method == "DELETE" and len(parts) == 3:
             uid = int(parts[2])
@@ -1602,6 +1679,8 @@ def handle_api(method, path, body, req):
 
     # ── SUPPLIERS ──
     if ep == "suppliers":
+        if not user_can_page(u, "suppliers"):
+            c.close(); return 403, {"detail":"غير مصرح — لا تملك صلاحية الوصول لبيانات الموردين"}
         if method=="GET" and len(parts)==2:
             r = SuppliersDAO.list(c); c.close(); return 200,r
         if method=="POST":
@@ -1703,6 +1782,8 @@ def handle_api(method, path, body, req):
 
     # ── PURCHASES ──
     if ep == "purchases":
+        if not user_can_page(u, "purchases"):
+            c.close(); return 403, {"detail":"غير مصرح — لا تملك صلاحية الوصول لبيانات المشتريات"}
         if method=="GET" and len(parts)==2:
             ps = PurchasesDAO.list(c); c.close(); return 200,ps
         if method=="GET" and len(parts)==3:
@@ -1780,6 +1861,8 @@ def handle_api(method, path, body, req):
 
     # ── PURCHASE RETURNS ──
     if ep == "purchase_returns":
+        if not user_can_page(u, "purchases"):
+            c.close(); return 403, {"detail":"غير مصرح — لا تملك صلاحية الوصول لبيانات المشتريات"}
         if method == "GET" and len(parts) == 2:
             rs = PurchaseReturnsDAO.list(c); c.close(); return 200, rs
         if method == "POST":
@@ -2357,6 +2440,8 @@ def handle_api(method, path, body, req):
 
     # ── PURCHASE RETURN (مردود) ──
     if ep == "purchase_return" and method == "POST":
+        if not user_can_page(u, "purchases"):
+            c.close(); return 403, {"detail":"غير مصرح — لا تملك صلاحية الوصول لبيانات المشتريات"}
         pid   = body.get("purchase_id")
         items = body.get("items", [])
         notes = body.get("notes", "")
@@ -2663,8 +2748,11 @@ async function loadAll(){
   loading=true; render();
   try{
     const [p,s,cu,pu,sl,st,pays,cfg,expCats,exps,emps,payr,recExp,svcOrd,acctPays,qts] = await Promise.all([
-      api('GET','/api/products'), api('GET','/api/suppliers'), api('GET','/api/customers'),
-      api('GET','/api/purchases'), api('GET','/api/sales'), api('GET','/api/dashboard'),
+      api('GET','/api/products'),
+      api('GET','/api/suppliers').catch(()=>[]),   // قد تُرفض (403) إن لم يملك المستخدم صلاحية الموردين
+      api('GET','/api/customers'),
+      api('GET','/api/purchases').catch(()=>[]),   // قد تُرفض (403) إن لم يملك المستخدم صلاحية المشتريات
+      api('GET','/api/sales'), api('GET','/api/dashboard'),
       api('GET','/api/payments'), api('GET','/api/settings'),
       api('GET','/api/expense_categories'), api('GET','/api/expenses'),
       api('GET','/api/employees'), api('GET','/api/payroll'), api('GET','/api/recurring_expenses'),
@@ -2846,12 +2934,12 @@ function ic(d,s=18){
 function appHTML(){
   const w=sideOpen?224:58;
   const role = USER?.role||'user';
-  // الصفحات المسموح بها لكل دور
-  const allowed = role==='admin'
+  // الصفحات المسموح بها لهذا المستخدم (مخصصة إن وُجدت، وإلا افتراضية حسب الدور)
+  const allowed = USER?.permissions?.pages || (role==='admin'
     ? ['dashboard','products','warehouse','purchases','pos','suppliers','customers','accounting','expenses','services','quotes','reports','settings']
     : role==='cashier'
     ? ['pos','products','quotes']
-    : ['dashboard','products','warehouse','purchases','pos','suppliers','customers','accounting','expenses','services','quotes','reports'];
+    : ['dashboard','products','warehouse','purchases','pos','suppliers','customers','accounting','expenses','services','quotes','reports']);
   const visibleNav = NAV.filter(n=>allowed.includes(n.id));
   // إعادة توجيه إذا الصفحة الحالية غير مسموح بها
   if(!allowed.includes(page)) page = allowed[0];
@@ -4427,9 +4515,19 @@ window.deletePaymentDirect = async function(id, party_type, party_id, name){
 };
 
 // REPORTS
+const REPORT_TABS = [
+  ['sales','المبيعات'],['detailed','التفصيلي (شراء/بيع/خدمة) 🧾'],['top-products','الأكثر/الأقل مبيعاً 📈'],
+  ['purchases','المشتريات'],['expenses-report','المصاريف 💸'],['sup-compare','مقارنة أسعار الموردين ⚖️'],
+  ['cheques','الشيكات 🏦'],['sup-detail','كشف مورد 🔍'],['cust-detail','كشف زبون 🔍'],
+  ['customers','ملخص الزبائن'],['suppliers-summary','ملخص الموردين'],['inventory','المخزون']
+];
 function reportsHTML(){
   const ts=sales.reduce((s,x)=>s+x.total,0), tp=purchases.reduce((s,x)=>s+x.total,0);
   const te=expenses.reduce((s,x)=>s+(x.amount||0),0);
+  // التبويبات المسموح بها لهذا المستخدم (مخصصة إن وُجدت، وإلا كل التبويبات)
+  const allowedReports = USER?.permissions?.reports || REPORT_TABS.map(([id])=>id);
+  const visibleTabs = REPORT_TABS.filter(([id])=>allowedReports.includes(id));
+  const firstTab = visibleTabs[0]?.[0] || 'sales';
   return `<div class="ti">التقارير</div><div class="sub">تقارير شاملة لجميع العمليات</div>
   <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px;">
     <div class="stat"><div style="font-size:13px;color:#64748b;">المبيعات</div><div style="font-size:19px;font-weight:800;color:#52b788;margin-top:7px;">${ts.toLocaleString()} ${cur()}</div></div>
@@ -4438,10 +4536,10 @@ function reportsHTML(){
     <div class="stat"><div style="font-size:13px;color:#64748b;">الربح الصافي</div><div style="font-size:19px;font-weight:800;color:#fbbf24;margin-top:7px;">${(ts-tp-te).toLocaleString()} ${cur()}</div></div>
   </div>
   <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap;" id="rep-tabs">
-    ${[['sales','المبيعات'],['detailed','التفصيلي (شراء/بيع/خدمة) 🧾'],['top-products','الأكثر/الأقل مبيعاً 📈'],['purchases','المشتريات'],['expenses-report','المصاريف 💸'],['sup-compare','مقارنة أسعار الموردين ⚖️'],['cheques','الشيكات 🏦'],['sup-detail','كشف مورد 🔍'],['cust-detail','كشف زبون 🔍'],['customers','ملخص الزبائن'],['suppliers-summary','ملخص الموردين'],['inventory','المخزون']
-    ].map(([id,label],i)=>`<button class="btn ${i===0?'p':'s'}" data-rep="${id}">${label}</button>`).join('')}
+    ${visibleTabs.length ? visibleTabs.map(([id,label],i)=>`<button class="btn ${i===0?'p':'s'}" data-rep="${id}">${label}</button>`).join('')
+      : '<div style="color:#64748b;font-size:13px;padding:10px;">لا تملك صلاحية الوصول لأي تقرير — راجع المدير</div>'}
   </div>
-  <div id="rc">${repContent('sales')}</div>`;
+  <div id="rc">${visibleTabs.length ? repContent(firstTab) : ''}</div>`;
 }
 
 function repContent(type){
@@ -6064,20 +6162,70 @@ function userModal(usr){
       </select>
     </div>
   </div>
-  <div style="background:#1a1d27;border-radius:8px;padding:12px;margin-top:14px;margin-bottom:16px;">
-    <div style="font-size:12px;font-weight:700;color:#94a3b8;margin-bottom:6px;">🔑 الصلاحيات لكل دور:</div>
+  <div style="background:#1a1d27;border-radius:8px;padding:12px;margin-top:14px;margin-bottom:12px;">
+    <div style="font-size:12px;font-weight:700;color:#94a3b8;margin-bottom:6px;">🔑 الصلاحيات الافتراضية لكل دور:</div>
     <div style="font-size:12px;color:#64748b;line-height:1.8;">
       <span class="badge r">مدير</span> — وصول كامل لجميع الصفحات والإعدادات<br/>
       <span class="badge b">كاشير</span> — نقطة البيع + عرض المنتجات فقط<br/>
       <span class="badge g">مستخدم</span> — جميع الصفحات بدون الإعدادات والمستخدمين
     </div>
   </div>
+
+  <div style="background:#1a1d27;border-radius:8px;padding:12px;margin-bottom:14px;">
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+      <input type="checkbox" id="uf-custom-toggle" onchange="ufToggleCustomPerms()" ${usr.permissions_custom?'checked':''} style="width:16px;height:16px;accent-color:#2d6a4f;flex-shrink:0;"/>
+      <span style="font-size:13px;font-weight:700;color:#f1f5f9;">🔧 تخصيص صلاحيات هذا المستخدم (بدل صلاحيات الدور الافتراضية)</span>
+    </label>
+  </div>
+
+  <div id="uf-custom-perms" style="display:${usr.permissions_custom?'block':'none'};margin-bottom:14px;">
+    <div style="font-size:12px;font-weight:700;color:#52b788;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;">
+      <span>📄 الصفحات المتاحة</span>
+      <span style="display:flex;gap:4px;">
+        <button type="button" class="btn s" style="padding:2px 8px;font-size:10px;" onclick="ufSelectAll('uf-page-',true)">تحديد الكل</button>
+        <button type="button" class="btn s" style="padding:2px 8px;font-size:10px;" onclick="ufSelectAll('uf-page-',false)">إلغاء الكل</button>
+      </span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:16px;background:#161923;border-radius:8px;padding:10px;">
+      ${NAV.map(n=>`<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#cbd5e1;cursor:pointer;">
+        <input type="checkbox" id="uf-page-${n.id}" ${(usr.permissions?.pages||[]).includes(n.id)?'checked':''} style="width:14px;height:14px;accent-color:#2d6a4f;flex-shrink:0;"/>
+        ${n.label}
+      </label>`).join('')}
+    </div>
+
+    <div style="font-size:12px;font-weight:700;color:#60a5fa;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;">
+      <span>📊 تبويبات التقارير المتاحة</span>
+      <span style="display:flex;gap:4px;">
+        <button type="button" class="btn s" style="padding:2px 8px;font-size:10px;" onclick="ufSelectAll('uf-rep-',true)">تحديد الكل</button>
+        <button type="button" class="btn s" style="padding:2px 8px;font-size:10px;" onclick="ufSelectAll('uf-rep-',false)">إلغاء الكل</button>
+      </span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px;background:#161923;border-radius:8px;padding:10px;">
+      ${REPORT_TABS.map(([id,label])=>`<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#cbd5e1;cursor:pointer;">
+        <input type="checkbox" id="uf-rep-${id}" ${(usr.permissions?.reports||[]).includes(id)?'checked':''} style="width:14px;height:14px;accent-color:#2d6a4f;flex-shrink:0;"/>
+        ${label}
+      </label>`).join('')}
+    </div>
+    <div style="font-size:11px;color:#64748b;margin-top:8px;">
+      ℹ️ صلاحية "الموردون" و"المشتريات" تُطبَّق فعلياً بمنع الوصول للبيانات من الخادم، أما تبويبات التقارير فهي تحكم فقط بما يظهر بواجهة هذا المستخدم.
+    </div>
+  </div>
+
   <div style="display:flex;gap:10px;">
     <button class="btn p" id="ms" style="flex:1;justify-content:center;">💾 ${isEdit?'حفظ التعديلات':'إضافة المستخدم'}</button>
     <button class="btn s" id="mc2">إلغاء</button>
   </div>
   </div></div>`;
 }
+
+window.ufToggleCustomPerms = function(){
+  const cb  = document.getElementById('uf-custom-toggle');
+  const box = document.getElementById('uf-custom-perms');
+  if(box) box.style.display = cb?.checked ? 'block' : 'none';
+};
+window.ufSelectAll = function(prefix, checked){
+  document.querySelectorAll(`input[id^="${prefix}"]`).forEach(el=>{ el.checked = checked; });
+};
 
 // ── مودال تعديل دفعة ──
 function editPaymentModal(p){
@@ -8139,10 +8287,20 @@ function bindModal(){
         errEl.innerHTML='<div class="err">كلمة المرور 4 أحرف على الأقل</div>'; return;
       }
 
+      // جمع الصلاحيات المخصصة إن كان المفتاح مفعّلاً، وإلا null (استخدام افتراضي الدور)
+      const customizing = document.getElementById('uf-custom-toggle')?.checked;
+      let permissions = null;
+      if(customizing){
+        permissions = {
+          pages:   NAV.map(n=>n.id).filter(id=>document.getElementById('uf-page-'+id)?.checked),
+          reports: REPORT_TABS.map(([id])=>id).filter(id=>document.getElementById('uf-rep-'+id)?.checked),
+        };
+      }
+
       try{
         let result;
         if(isEdit){
-          const body = {full_name:fname, role, is_active:active};
+          const body = {full_name:fname, role, is_active:active, permissions};
           if(pw) body.password = pw;
           result = await api('PUT','/api/users/'+MS.data.id, body);
           // تحديث القائمة المحلية
@@ -8152,7 +8310,7 @@ function bindModal(){
           const uname = document.getElementById('uf-username')?.value?.trim()||'';
           if(!uname){ errEl.innerHTML='<div class="err">اسم المستخدم مطلوب</div>'; return; }
           if(!pw){ errEl.innerHTML='<div class="err">كلمة المرور مطلوبة</div>'; return; }
-          result = await api('POST','/api/users',{username:uname, password:pw, full_name:fname, role});
+          result = await api('POST','/api/users',{username:uname, password:pw, full_name:fname, role, permissions});
           sysUsers.push(result);
         }
         closeM();
@@ -8462,7 +8620,10 @@ function bindPage(){
       afterRepRender(btn.dataset.rep);
     };
   });
-  if(page==='reports') afterRepRender('sales');
+  if(page==='reports'){
+    const firstBtn = document.querySelector('[data-rep]');
+    if(firstBtn) afterRepRender(firstBtn.dataset.rep);
+  }
 
   // Settings
   if(page==='settings'){
@@ -9445,7 +9606,7 @@ function renderSettingsTab(tab){
         <td style="color:#64748b;">${usr.id}</td>
         <td style="font-weight:700;color:#60a5fa;font-family:monospace;">${usr.username}</td>
         <td style="color:#f1f5f9;">${usr.full_name||'—'}</td>
-        <td><span class="badge ${usr.role==='admin'?'r':usr.role==='cashier'?'b':'g'}">${{admin:'مدير',user:'مستخدم',cashier:'كاشير'}[usr.role]||usr.role}</span></td>
+        <td><span class="badge ${usr.role==='admin'?'r':usr.role==='cashier'?'b':'g'}">${{admin:'مدير',user:'مستخدم',cashier:'كاشير'}[usr.role]||usr.role}</span>${usr.permissions_custom?' <span class="badge y" style="font-size:10px;" title="صلاحيات مخصصة">🔧 مخصصة</span>':''}</td>
         <td><span class="badge ${usr.is_active?'g':'r'}">${usr.is_active?'نشط':'موقوف'}</span></td>
         <td style="color:#64748b;font-size:12px;">${(usr.created_at||'').slice(0,10)}</td>
         <td><div style="display:flex;gap:5px;">
