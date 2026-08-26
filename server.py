@@ -2276,6 +2276,20 @@ def handle_api(method, path, body, req):
                 c.execute("UPDATE quotes SET customer_id=? WHERE id=?", (customer_id, qid))
             product_items = [i for i in q["items"] if i["kind"] == "product"]
             service_items = [i for i in q["items"] if i["kind"] == "service"]
+
+            # التحقق من توفر السيريالات المطلوبة للمنتجات المتتبَّعة بسيريال فريد قبل أي تعديل بقاعدة البيانات
+            serials_map = body.get("serials", {}) or {}
+            for i in product_items:
+                prod = ProductsDAO.get_by_id(c, i["product_id"])
+                if prod and prod.get("track_serial"):
+                    given = [str(s).strip() for s in serials_map.get(str(i["product_id"]), []) if str(s).strip()]
+                    if len(given) != i["qty"]:
+                        c.close(); return 400, {"detail": f"يجب إدخال {i['qty']} سيريال للمنتج {prod['name']}"}
+                    for s in given:
+                        unit = ProductUnitsDAO.get_by_serial(c, s)
+                        if not unit or str(unit.get("product_id")) != str(i["product_id"]) or unit["status"] != "in_stock":
+                            c.close(); return 400, {"detail": f"السيريال {s} غير متاح للبيع"}
+
             today = datetime.now().strftime("%Y-%m-%d")
             sale_id = None; service_id = None
             if product_items:
@@ -2287,6 +2301,10 @@ def handle_api(method, path, body, req):
                     cost_snapshot = (prod["buy_price"] if prod else 0) or 0
                     SalesDAO.create_item(c, sale_id, i["product_id"], i["qty"], i["price"], 0, cost_snapshot)
                     ProductsDAO.update_stock(c, i["product_id"], -i["qty"])
+                    if prod and prod.get("track_serial"):
+                        given = [str(s).strip() for s in serials_map.get(str(i["product_id"]), []) if str(s).strip()]
+                        for s in given:
+                            ProductUnitsDAO.mark_sold_by_serial(c, s, i["product_id"], sale_id)
             if service_items:
                 svc_fee = sum(i["qty"]*i["price"] for i in service_items)
                 device_desc = "، ".join(i["description"] or "خدمة" for i in service_items)
@@ -4201,10 +4219,55 @@ window.updateQuoteStatus = async function(id, status){
   catch(e){ alert('خطأ: '+e.message); }
 };
 
-window.convertQuote = async function(id){
+// ── مودال إدخال السيريالات المطلوبة لمنتجات متتبَّعة ضمن عرض سعر قبل تحويله لفاتورة بيع ──
+function quoteConvertSerialsModal(d){
+  const items = d.items||[];
+  return `<div class="overlay" id="mover"><div class="modal" style="max-width:560px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+    <div>
+      <div style="font-size:16px;font-weight:800;color:#f1f5f9;">📟 إدخال السيريالات قبل التحويل</div>
+      <div style="font-size:12px;color:#64748b;margin-top:2px;">عرض سعر #${d.quote.id} يحتوي منتجات تتطلب سيريال فريد لكل قطعة</div>
+    </div>
+    <button class="btn s" style="padding:4px 9px;" id="mc">✕</button>
+  </div>
+  <div id="merr"></div>
+  ${items.map((item,idx)=>{
+    const prod = products.find(p=>p.id===item.product_id);
+    return `<div style="margin-bottom:14px;">
+      <label class="lbl">${esc(prod?.name||('منتج #'+item.product_id))} — مطلوب <span style="color:#52b788;font-weight:700;">${item.qty}</span> سيريال (سطر لكل سيريال)</label>
+      <textarea id="qcs-${idx}" class="inp" style="min-height:80px;font-family:monospace;font-size:13px;" placeholder="مثال:
+SN00123
+SN00124"></textarea>
+    </div>`;
+  }).join('')}
+  <div style="display:flex;gap:10px;margin-top:10px;">
+    <button class="btn p" id="qcs-confirm" style="flex:1;justify-content:center;">✅ تأكيد والمتابعة للتحويل</button>
+    <button class="btn s" id="mc2">إلغاء</button>
+  </div>
+  </div></div>`;
+}
+
+window.convertQuote = function(id){
+  const q = quotes.find(x=>x.id===id);
+  if(!q){ alert('عرض السعر غير موجود'); return; }
+  const productItems = (q.items||[]).filter(i=>i.kind==='product');
+  const serialItems = productItems.filter(i=>{
+    const p = products.find(pp=>pp.id===i.product_id);
+    return p && p.track_serial;
+  });
+  if(serialItems.length){
+    // يحتوي العرض منتجاً/أكثر يتطلب سيريال فريد — نطلب إدخال السيريالات أولاً قبل التحويل الفعلي
+    MS = {type:'quoteConvertSerials', data:{quote:q, items:serialItems}};
+    render();
+    return;
+  }
+  doConvertQuote(id, {});
+};
+
+window.doConvertQuote = async function(id, serialsMap){
   if(!confirm('هل تريد تحويل عرض السعر هذا لفاتورة بيع (وطلب خدمة إن وجد)؟\nسيتم إنقاص المخزون للمنتجات فوراً.')) return;
   try{
-    const res = await api('POST','/api/quotes/'+id+'/convert', {});
+    const res = await api('POST','/api/quotes/'+id+'/convert', {serials: serialsMap||{}});
     await loadAll();
     let msg = '✅ تم التحويل بنجاح';
     if(res.sale_id) msg += ` — فاتورة بيع #${res.sale_id}`;
@@ -5990,6 +6053,7 @@ function modalHTML(){
   if(MS.type==='payrollform') return payrollFormModal(MS.data||{});
   if(MS.type==='quoteform') return quoteFormModal(MS.data||{});
   if(MS.type==='quotedetail') return quoteDetailModal(MS.data||{});
+  if(MS.type==='quoteConvertSerials') return quoteConvertSerialsModal(MS.data||{});
   if(MS.type==='paymentslist') return paymentsListModal(MS.data||{});
   return '';
 }
@@ -7646,6 +7710,33 @@ function bindModal(){
         page='services'; closeM();
       }catch(e){ errEl.innerHTML='<div class="err">'+e.message+'</div>'; }
     };
+  }
+
+  // ── تأكيد سيريالات عرض السعر قبل التحويل ──
+  if(MS?.type==='quoteConvertSerials'){
+    document.getElementById('qcs-confirm')?.addEventListener('click', ()=>{
+      const errEl = document.getElementById('merr');
+      const items = MS.data.items;
+      const serialsMap = {};
+      for(let idx=0; idx<items.length; idx++){
+        const item = items[idx];
+        const prod = products.find(p=>p.id===item.product_id);
+        const raw = document.getElementById('qcs-'+idx)?.value || '';
+        const serials = raw.split('\n').map(s=>s.trim()).filter(Boolean);
+        if(serials.length !== item.qty){
+          errEl.innerHTML = `<div class="err">عدد السيريالات لـ "${esc(prod?.name||'')}" يجب أن يكون ${item.qty} (أدخلت ${serials.length})</div>`;
+          return;
+        }
+        if(new Set(serials).size !== serials.length){
+          errEl.innerHTML = `<div class="err">يوجد سيريال مكرر ضمن قائمة "${esc(prod?.name||'')}"</div>`;
+          return;
+        }
+        serialsMap[item.product_id] = serials;
+      }
+      const quoteId = MS.data.quote.id;
+      MS = null;
+      doConvertQuote(quoteId, serialsMap);
+    });
   }
 
   // ── نموذج عرض السعر ──
