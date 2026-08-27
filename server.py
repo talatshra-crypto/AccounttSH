@@ -4338,42 +4338,58 @@ window.accTab = async function(tab){
     el.innerHTML='<div class="spin"></div>';
     try{
       const pays = await api('GET','/api/payments');
-      el.innerHTML = pays.length
-        ? '<div class="card"><table>'
+
+      // تصنيف الدفعات: مشتريات (فواتير شراء + دفعات حساب مباشرة لمورد) مقابل مبيعات (فواتير بيع/خدمة + دفعات حساب مباشرة لزبون)
+      const purchasePays = pays.filter(p => p.ref_type==='purchase' || (p.ref_type==='account' && p.party_type==='supplier'));
+      const salesPays    = pays.filter(p => p.ref_type==='sale' || p.ref_type==='service' || (p.ref_type==='account' && p.party_type==='customer'));
+
+      function payRowLabel(p){
+        if(p.ref_type==='account') return {label:'💼 دفعة على الحساب', cls: p.party_type==='supplier'?'b':'g'};
+        if(p.ref_type==='service') return {label:'🔧 خدمة #'+p.ref_id, cls:'y'};
+        if(p.ref_type==='purchase') return {label:'فاتورة شراء #'+p.ref_id, cls:'b'};
+        return {label:'فاتورة بيع #'+p.ref_id, cls:'g'};
+      }
+
+      function paymentsTableHTML(list, emptyMsg){
+        if(!list.length) return `<div style="text-align:center;color:#64748b;padding:24px;">${emptyMsg}</div>`;
+        return '<table>'
           + '<thead><tr><th>التاريخ</th><th>النوع</th><th>المبلغ</th><th>الطريقة</th><th>رقم الشيك</th><th>البنك</th><th>ملاحظات</th></tr></thead><tbody>'
-          + pays.map(p=>{
-              const inv = p.ref_type==='purchase'
-                ? purchases.find(x=>x.id===p.ref_id)
-                : sales.find(x=>x.id===p.ref_id);
+          + list.map(p=>{
               const party = p.party_type==='supplier'
                 ? suppliers.find(s=>s.id===parseInt(p.party_id))?.name||'—'
                 : customers.find(c=>c.id===parseInt(p.party_id))?.name||'—';
+              const {label, cls} = payRowLabel(p);
               return '<tr>'
                 + '<td style="font-weight:600;">'+p.date+'</td>'
-                + (()=>{
-                    let label, cls;
-                    if(p.ref_type==='account'){
-                      label = p.party_type==='supplier' ? '💼 دفعة حساب (شراء)' : '💼 دفعة حساب (بيع)';
-                      cls   = p.party_type==='supplier' ? 'b' : 'g';
-                    } else if(p.ref_type==='service'){
-                      label = '🔧 خدمة'; cls='y';
-                    } else {
-                      label = p.ref_type==='purchase' ? 'شراء' : 'بيع';
-                      cls   = p.ref_type==='purchase' ? 'b' : 'g';
-                    }
-                    return '<td><div style="font-size:12px;"><span class="badge '+cls+'">'+label+'</span><div style="color:#94a3b8;font-size:11px;margin-top:2px;">'+party+'</div></div></td>';
-                  })()
-                + '<td style="font-weight:800;color:#52b788;">'+p.amount.toLocaleString()+' ر.س</td>'
+                + '<td><div style="font-size:12px;"><span class="badge '+cls+'">'+label+'</span><div style="color:#94a3b8;font-size:11px;margin-top:2px;">'+esc(party)+'</div></div></td>'
+                + '<td style="font-weight:800;color:#52b788;">'+p.amount.toLocaleString()+' '+cur()+'</td>'
                 + '<td><span class="badge '+(p.method==='نقدي'?'g':p.method==='شيك'?'b':'y')+'">'+p.method+'</span></td>'
                 + '<td style="font-family:monospace;color:#60a5fa;">'+(p.cheque_no||'—')+'</td>'
                 + '<td style="font-size:12px;color:#94a3b8;">'+(p.cheque_bank||'—')+'</td>'
-                + '<td style="font-size:12px;color:#64748b;">'+(p.notes||'')+'</td>'
+                + '<td style="font-size:12px;color:#64748b;">'+esc(p.notes||'')+'</td>'
               + '</tr>';
             }).join('')
-          + '</tbody></table></div>'
-          + '<div style="text-align:left;padding:12px 16px;font-size:15px;font-weight:800;color:#52b788;background:#161923;border-radius:8px;margin-top:8px;">'
-          + 'إجمالي الدفعات: '+pays.reduce((s,p)=>s+p.amount,0).toLocaleString()+' ر.س</div>'
-        : '<div style="text-align:center;color:#64748b;padding:30px;">لا توجد دفعات مسجلة</div>';
+          + '</tbody></table>';
+      }
+
+      const purchaseTotal = purchasePays.reduce((s,p)=>s+p.amount,0);
+      const salesTotal    = salesPays.reduce((s,p)=>s+p.amount,0);
+
+      el.innerHTML =
+        '<div class="card" style="margin-bottom:16px;overflow:hidden;">'
+          + '<div style="background:#1a1d27;padding:12px 16px;border-bottom:1px solid #1e2537;">'
+            + '<div style="font-weight:800;color:#60a5fa;font-size:14px;">📤 دفعات المشتريات (للموردين) — '+purchasePays.length+' دفعة</div>'
+          + '</div>'
+          + paymentsTableHTML(purchasePays, 'لا توجد دفعات مشتريات مسجلة')
+          + (purchasePays.length ? '<div style="text-align:left;padding:10px 16px;font-size:14px;font-weight:800;color:#60a5fa;border-top:1px solid #1e2537;">إجمالي دفعات المشتريات: '+purchaseTotal.toLocaleString()+' '+cur()+'</div>' : '')
+        + '</div>'
+        + '<div class="card" style="overflow:hidden;">'
+          + '<div style="background:#1a1d27;padding:12px 16px;border-bottom:1px solid #1e2537;">'
+            + '<div style="font-weight:800;color:#52b788;font-size:14px;">📥 دفعات المبيعات (من الزبائن) — '+salesPays.length+' دفعة</div>'
+          + '</div>'
+          + paymentsTableHTML(salesPays, 'لا توجد دفعات مبيعات مسجلة')
+          + (salesPays.length ? '<div style="text-align:left;padding:10px 16px;font-size:14px;font-weight:800;color:#52b788;border-top:1px solid #1e2537;">إجمالي دفعات المبيعات: '+salesTotal.toLocaleString()+' '+cur()+'</div>' : '')
+        + '</div>';
     }catch(e){ el.innerHTML='<div class="err">خطأ: '+e.message+'</div>'; }
     return;
   }
