@@ -1355,12 +1355,13 @@ class ReportsDAO(BaseDAO):
         total_paid = sum(p["paid"] for p in ps)
         total_remain_inv = sum(p["remaining"] for p in ps)
         account_paid = PaymentsDAO.total_by_party_account(c, "supplier", sup_id)
+        opening_balance = sup.get("balance") or 0
         total_paid_final = total_paid + account_paid
-        total_remain = max(0, total_remain_inv - account_paid)
+        total_remain = max(0, total_remain_inv + opening_balance - account_paid)
         all_payments = PaymentsDAO.get_by_party(c, "supplier", sup_id)
         return {"supplier": sup, "purchases": ps, "total": total_sup,
                 "total_paid": total_paid_final, "total_remaining": total_remain,
-                "account_paid": account_paid, "all_payments": all_payments,
+                "account_paid": account_paid, "opening_balance": opening_balance, "all_payments": all_payments,
                 "date_from": date_from, "date_to": date_to, "count": len(ps)}
 
     @staticmethod
@@ -1405,12 +1406,13 @@ class ReportsDAO(BaseDAO):
         total_paid = sum(s["paid"] for s in ss) + sum(so["paid"] for so in sos)
         total_remain_inv = sum(s["remaining"] for s in ss) + sum(so["remaining"] for so in sos)
         account_paid = PaymentsDAO.total_by_party_account(c, "customer", cust_id)
+        opening_balance = cust.get("balance") or 0
         total_paid_final = total_paid + account_paid
-        total_remain = max(0, total_remain_inv - account_paid)
+        total_remain = max(0, total_remain_inv + opening_balance - account_paid)
         all_payments = PaymentsDAO.get_by_party(c, "customer", cust_id)
         return {"customer": cust, "sales": ss, "services": sos, "transactions": transactions, "total": total_s,
                 "total_paid": total_paid_final, "total_remaining": total_remain,
-                "account_paid": account_paid, "all_payments": all_payments,
+                "account_paid": account_paid, "opening_balance": opening_balance, "all_payments": all_payments,
                 "date_from": date_from, "date_to": date_to, "count": len(transactions)}
 
     @staticmethod
@@ -1451,6 +1453,7 @@ class ReportsDAO(BaseDAO):
         result = []
         total_inv = 0; total_paid_invoices = 0
         if party_type == "supplier":
+            party_row = SuppliersDAO.get_by_id(c, party_id)
             invs = BaseDAO.rows(c.execute(
                 "SELECT * FROM purchases WHERE CAST(supplier_id AS INTEGER)=? AND status!='مردود'", (party_id,)))
             for inv in invs:
@@ -1459,6 +1462,7 @@ class ReportsDAO(BaseDAO):
                 total_inv += abs(inv["total"]); total_paid_invoices += paid
                 result.append({**inv, "paid": paid, "remaining": remaining, "ref_type": "purchase"})
         else:
+            party_row = CustomersDAO.get_by_id(c, party_id)
             invs = BaseDAO.rows(c.execute(
                 "SELECT * FROM sales WHERE CAST(customer_id AS INTEGER)=?", (party_id,)))
             for inv in invs:
@@ -1477,11 +1481,12 @@ class ReportsDAO(BaseDAO):
                                 "paid": paid, "remaining": remaining, "ref_type": "service"})
             result.sort(key=lambda x: x.get("date") or "")
         account_paid = PaymentsDAO.total_by_party_account(c, party_type, party_id)
+        opening_balance = (party_row.get("balance") or 0) if party_row else 0
         total_paid = total_paid_invoices + account_paid
         return {"invoices": result, "total_invoices": total_inv,
                 "total_paid": total_paid, "total_paid_invoices": total_paid_invoices,
-                "account_paid": account_paid,
-                "total_remaining": max(0, total_inv - total_paid)}
+                "account_paid": account_paid, "opening_balance": opening_balance,
+                "total_remaining": max(0, total_inv + opening_balance - total_paid)}
 
 # ══════════════════════════════════════════════
 #  API
@@ -2709,20 +2714,24 @@ function customerAccountPaid(custId){
     .reduce((t,p)=>t+(p.amount||0), 0);
 }
 
-// إجمالي المستحق (غير المسدد) لمورد معيّن من جميع فواتير الشراء غير المردودة، مطروحاً منه دفعات الحساب المباشرة
+// إجمالي المستحق (غير المسدد) لمورد معيّن من جميع فواتير الشراء غير المردودة، مطروحاً منه دفعات الحساب المباشرة، مضافاً إليه الرصيد الافتتاحي
 function supplierPayable(supId){
+  const sup = suppliers.find(s=>s.id===parseInt(supId));
+  const openingBalance = parseFloat(sup?.balance||0) || 0;
   const purs = purchases.filter(p=>parseInt(p.supplier_id)===parseInt(supId) && p.status!=='مردود');
   const invoicesDue = purs.reduce((t,p)=>t + Math.max(0, (p.total||0)-(p.paid||0)), 0);
-  return Math.max(0, invoicesDue - supplierAccountPaid(supId));
+  return Math.max(0, invoicesDue + openingBalance - supplierAccountPaid(supId));
 }
 
-// إجمالي المستحق على زبون معيّن من كل مبيعاته وطلبات خدماته، مطروحاً منه دفعات الحساب المباشرة
+// إجمالي المستحق على زبون معيّن من كل مبيعاته وطلبات خدماته، مطروحاً منه دفعات الحساب المباشرة، مضافاً إليه الرصيد الافتتاحي
 function customerReceivable(custId){
+  const cust = customers.find(c=>c.id===parseInt(custId));
+  const openingBalance = parseFloat(cust?.balance||0) || 0;
   const custSales = sales.filter(s=>parseInt(s.customer_id)===parseInt(custId));
   const custServices = serviceOrders.filter(o=>parseInt(o.customer_id)===parseInt(custId));
   const invoicesDue = custSales.reduce((t,s)=>t + Math.max(0,(s.total||0)-(s.paid||0)), 0)
                     + custServices.reduce((t,o)=>t + Math.max(0,(o.service_fee||0)-(o.paid||0)), 0);
-  return Math.max(0, invoicesDue - customerAccountPaid(custId));
+  return Math.max(0, invoicesDue + openingBalance - customerAccountPaid(custId));
 }
 
 // الموردون الذين تجاوزت مستحقاتهم حد التنبيه المحدد بالإعدادات
@@ -3472,7 +3481,7 @@ function entityHTML(type,title,sub){
     <button class="btn p" id="ea" data-type="${type}">+ اضافة</button>
   </div>
   <div class="card"><table>
-    <thead><tr><th>الاسم</th><th>الهاتف</th><th>المدينة</th><th>الرصيد</th><th></th></tr></thead>
+    <thead><tr><th>الاسم</th><th>الهاتف</th><th>المدينة</th><th>المستحق الفعلي</th><th></th></tr></thead>
     <tbody id="etb"></tbody>
   </table></div>`;
 }
@@ -3492,11 +3501,13 @@ function renderEntity(type,q=''){
       const threshold = parseFloat(sysSettings.supplier_payable_alert_threshold||5000);
       if(payable >= threshold && payable > 0) nameExtra += ` <span class="badge y" style="font-size:10px;">⚠️ مستحق ${payable.toLocaleString()} ${cur()}</span>`;
     }
+    const actualDue = type==='suppliers' ? supplierPayable(x.id) : customerReceivable(x.id);
+    const openingBalance = parseFloat(x.balance||0) || 0;
     return `<tr>
     <td style="font-weight:700;color:#f1f5f9;">${esc(x.name)}${nameExtra}</td>
     <td style="color:#60a5fa;">${esc(x.phone)||''}</td>
     <td><span class="badge b">${esc(x.city)||''}</span></td>
-    <td><span class="badge ${x.balance!==0?'y':'g'}">${Math.abs(x.balance||0).toLocaleString()} ${cur()}</span></td>
+    <td><span class="badge ${actualDue!==0?'y':'g'}">${actualDue.toLocaleString()} ${cur()}</span>${openingBalance?`<div style="font-size:10px;color:#64748b;margin-top:2px;">منها ${openingBalance.toLocaleString()} ${cur()} رصيد افتتاحي</div>`:''}</td>
     <td><div style="display:flex;gap:5px;">
       <button class="btn p" style="padding:4px 9px;font-size:12px;background:linear-gradient(135deg,#1e40af,#1e3a8a);" onclick="openAccountPay('${type}',${x.id},'${x.name}')">💳 دفعة</button>
       <button class="btn s" style="padding:4px 8px;" onclick="openPaymentsListModal('${type}',${x.id},'${x.name.replace(/'/g,"\\'")}')" title="سجل الدفعات (تعديل/حذف)">📋 الدفعات</button>
@@ -3508,47 +3519,26 @@ function renderEntity(type,q=''){
 }
 
 // ACCOUNTING
-function accountingHTML(){
-  const ts = sales.reduce((s,x)=>s+x.total, 0) + serviceOrders.reduce((s,x)=>s+(x.service_fee||0), 0);
+function accSumContentHTML(){
+  const tsSales    = sales.reduce((s,x)=>s+x.total, 0);
+  const tsServices = serviceOrders.reduce((s,x)=>s+(x.service_fee||0), 0);
+  const ts = tsSales + tsServices;
   const tp = purchases.reduce((s,x)=>s+x.total, 0);
-
-  // حساب إجمالي مشتريات كل مورد من الفواتير الفعلية (بالمبالغ الحقيقية، مع خصم دفعات الحساب المباشرة)
-  supStats = suppliers.map(s=>{
-    const purList = purchases.filter(p=> parseInt(p.supplier_id)===s.id && p.status!=='مردود');
-    const total   = purList.reduce((t,p)=>t+p.total, 0);
-    const accPaid = supplierAccountPaid(s.id);
-    const paid    = purList.reduce((t,p)=>t+(p.paid||0), 0) + accPaid;
-    const pending = supplierPayable(s.id);
-    return {...s, purTotal:total, purPaid:paid, purPending:pending, purCount:purList.length, accPaid};
-  });
-
-  // حساب إجمالي مبيعات وخدمات كل زبون من الفواتير الفعلية (مع خصم دفعات الحساب المباشرة)
-  custStats = customers.map(c=>{
-    const saleList = sales.filter(s=> parseInt(s.customer_id)===c.id);
-    const svcList  = serviceOrders.filter(o=> parseInt(o.customer_id)===c.id);
-    const total    = saleList.reduce((t,s)=>t+s.total, 0) + svcList.reduce((t,o)=>t+(o.service_fee||0), 0);
-    const accPaid  = customerAccountPaid(c.id);
-    const paid     = saleList.reduce((t,s)=>t+(s.paid||0), 0) + svcList.reduce((t,o)=>t+(o.paid||0), 0) + accPaid;
-    const pending  = customerReceivable(c.id);
-    return {...c, saleTotal:total, salePaid:paid, salePending:pending, saleCount:saleList.length+svcList.length, accPaid};
-  });
-
   const totalPending = supStats.reduce((s,x)=>s+x.purPending, 0);
   const totalReceive = custStats.reduce((s,x)=>s+x.salePending, 0);
-
-  return `<div class="ti">الحسابات</div><div class="sub">المتابعة المالية الشاملة</div>
-  <div style="display:flex;gap:8px;margin-bottom:16px;">
-    <button class="btn p" id="acc-tab-sum" onclick="accTab('sum')">ملخص</button>
-    <button class="btn s" id="acc-tab-sup" onclick="accTab('sup')">كشف موردين</button>
-    <button class="btn s" id="acc-tab-cust" onclick="accTab('cust')">كشف زبائن</button>
-    <button class="btn s" id="acc-tab-pays" onclick="accTab('pays')">سجل الدفعات</button>
-  </div>
-  <div id="acc-content">
-
-  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px;">
+  return `
+  <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:14px;margin-bottom:22px;">
     <div class="stat">
-      <div style="font-size:12px;color:#64748b;">إجمالي المبيعات</div>
-      <div style="font-size:18px;font-weight:800;color:#52b788;margin-top:6px;">${ts.toLocaleString()} ${cur()}</div>
+      <div style="font-size:12px;color:#64748b;">المبيعات</div>
+      <div style="font-size:18px;font-weight:800;color:#52b788;margin-top:6px;">${tsSales.toLocaleString()} ${cur()}</div>
+    </div>
+    <div class="stat">
+      <div style="font-size:12px;color:#64748b;">إيراد الخدمات</div>
+      <div style="font-size:18px;font-weight:800;color:#a78bfa;margin-top:6px;">${tsServices.toLocaleString()} ${cur()}</div>
+    </div>
+    <div class="stat">
+      <div style="font-size:12px;color:#64748b;">إجمالي المبيعات والخدمات</div>
+      <div style="font-size:18px;font-weight:800;color:#34d399;margin-top:6px;">${ts.toLocaleString()} ${cur()}</div>
     </div>
     <div class="stat">
       <div style="font-size:12px;color:#64748b;">إجمالي المشتريات</div>
@@ -3606,8 +3596,39 @@ function accountingHTML(){
       </div>`).join('') : '<div style="color:#64748b;text-align:center;padding:20px;">لا يوجد زبائن</div>'}
     </div>
 
-  </div></div>
   </div>`;
+}
+
+function accountingHTML(){
+  // حساب إجمالي مشتريات كل مورد من الفواتير الفعلية (بالمبالغ الحقيقية، مع خصم دفعات الحساب المباشرة)
+  supStats = suppliers.map(s=>{
+    const purList = purchases.filter(p=> parseInt(p.supplier_id)===s.id && p.status!=='مردود');
+    const total   = purList.reduce((t,p)=>t+p.total, 0);
+    const accPaid = supplierAccountPaid(s.id);
+    const paid    = purList.reduce((t,p)=>t+(p.paid||0), 0) + accPaid;
+    const pending = supplierPayable(s.id);
+    return {...s, purTotal:total, purPaid:paid, purPending:pending, purCount:purList.length, accPaid};
+  });
+
+  // حساب إجمالي مبيعات وخدمات كل زبون من الفواتير الفعلية (مع خصم دفعات الحساب المباشرة)
+  custStats = customers.map(c=>{
+    const saleList = sales.filter(s=> parseInt(s.customer_id)===c.id);
+    const svcList  = serviceOrders.filter(o=> parseInt(o.customer_id)===c.id);
+    const total    = saleList.reduce((t,s)=>t+s.total, 0) + svcList.reduce((t,o)=>t+(o.service_fee||0), 0);
+    const accPaid  = customerAccountPaid(c.id);
+    const paid     = saleList.reduce((t,s)=>t+(s.paid||0), 0) + svcList.reduce((t,o)=>t+(o.paid||0), 0) + accPaid;
+    const pending  = customerReceivable(c.id);
+    return {...c, saleTotal:total, salePaid:paid, salePending:pending, saleCount:saleList.length+svcList.length, accPaid};
+  });
+
+  return `<div class="ti">الحسابات</div><div class="sub">المتابعة المالية الشاملة</div>
+  <div style="display:flex;gap:8px;margin-bottom:16px;">
+    <button class="btn p" id="acc-tab-sum" onclick="accTab('sum')">ملخص</button>
+    <button class="btn s" id="acc-tab-sup" onclick="accTab('sup')">كشف موردين</button>
+    <button class="btn s" id="acc-tab-cust" onclick="accTab('cust')">كشف زبائن</button>
+    <button class="btn s" id="acc-tab-pays" onclick="accTab('pays')">سجل الدفعات</button>
+  </div>
+  <div id="acc-content">${accSumContentHTML()}</div>`;
 }
 
 // ══════════════════════════════════════════════
@@ -4330,7 +4351,7 @@ window.accTab = async function(tab){
   });
 
   if(tab==='sum'){
-    el.innerHTML = document.getElementById('acc-sum-content')?.innerHTML || '';
+    el.innerHTML = accSumContentHTML();
     return;
   }
 
@@ -4480,7 +4501,9 @@ function paySummaryHTML(data, name, party_type, party_id){
     + '<div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">إجمالي المدفوع</div><div style="font-size:18px;font-weight:800;color:#52b788;margin-top:6px;">'+total_paid.toLocaleString()+' '+cur()+'</div>'
       + (data.account_paid>0?('<div style="font-size:10px;color:#94a3b8;margin-top:2px;">منها '+data.account_paid.toLocaleString()+' '+cur()+' دفعات حساب مباشرة</div>'):'')
     + '</div>'
-    + '<div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">المتبقي</div><div style="font-size:18px;font-weight:800;color:'+(total_remaining>0?'#f87171':'#52b788')+';margin-top:6px;">'+total_remaining.toLocaleString()+' '+cur()+'</div></div>'
+    + '<div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">المتبقي</div><div style="font-size:18px;font-weight:800;color:'+(total_remaining>0?'#f87171':'#52b788')+';margin-top:6px;">'+total_remaining.toLocaleString()+' '+cur()+'</div>'
+      + (data.opening_balance?('<div style="font-size:10px;color:#94a3b8;margin-top:2px;">شامل '+data.opening_balance.toLocaleString()+' '+cur()+' رصيد افتتاحي</div>'):'')
+    + '</div>'
   + '</div>'
   + '<div class="card"><table>'
     + '<thead><tr><th>#</th><th>النوع</th><th>التاريخ</th><th>الإجمالي</th><th>المدفوع</th><th>المتبقي</th><th>الحالة</th><th></th></tr></thead>'
@@ -5618,7 +5641,7 @@ function custServiceCardHTML(so){
 }
 
 function custRepHTML(d){
-  const {customer:c,transactions:tx,total,total_paid,total_remaining,all_payments,count,date_from,date_to,account_paid=0}=d;
+  const {customer:c,transactions:tx,total,total_paid,total_remaining,all_payments,count,date_from,date_to,account_paid=0,opening_balance=0}=d;
   const tier = customerTier(c.id);
   const overdue = customerOverdueInfo(c.id);
   return `<div id="spa">
@@ -5638,7 +5661,7 @@ function custRepHTML(d){
       <div class="stat"><div style="font-size:12px;color:#64748b;">عدد العمليات</div><div style="font-size:18px;font-weight:800;color:#60a5fa;margin-top:4px;">${count}</div></div>
       <div class="stat"><div style="font-size:12px;color:#64748b;">الإجمالي (مبيعات + خدمات)</div><div style="font-size:18px;font-weight:800;color:#f1f5f9;margin-top:4px;">${total.toLocaleString()} ${cur()}</div></div>
       <div class="stat"><div style="font-size:12px;color:#64748b;">إجمالي المدفوع</div><div style="font-size:18px;font-weight:800;color:#52b788;margin-top:4px;">${(total_paid||0).toLocaleString()} ${cur()}</div>${account_paid>0?`<div style="font-size:10px;color:#94a3b8;margin-top:2px;">منها ${account_paid.toLocaleString()} ${cur()} دفعات مباشرة</div>`:''}</div>
-      <div class="stat"><div style="font-size:12px;color:#64748b;">المتبقي (مستحق)</div><div style="font-size:18px;font-weight:800;color:${(total_remaining||0)>0?'#fbbf24':'#52b788'};margin-top:4px;">${(total_remaining||0).toLocaleString()} ${cur()}</div></div>
+      <div class="stat"><div style="font-size:12px;color:#64748b;">المتبقي (مستحق)</div><div style="font-size:18px;font-weight:800;color:${(total_remaining||0)>0?'#fbbf24':'#52b788'};margin-top:4px;">${(total_remaining||0).toLocaleString()} ${cur()}</div>${opening_balance?`<div style="font-size:10px;color:#94a3b8;margin-top:2px;">شامل ${opening_balance.toLocaleString()} ${cur()} رصيد افتتاحي</div>`:''}</div>
     </div>
   </div>
   ${(tx||[]).map(t=>t.kind==='service'?custServiceCardHTML(t):custSaleCardHTML(t)).join('')||'<div class="card" style="padding:28px;text-align:center;color:#475569;">لا توجد عمليات في هذه الفترة</div>'}
@@ -5693,7 +5716,7 @@ function custRepHTML(d){
 }
 
 function supRepHTML(d){
-  const {supplier:s,purchases:ps,total,total_paid,total_remaining,all_payments,count,date_from,date_to,account_paid=0}=d;
+  const {supplier:s,purchases:ps,total,total_paid,total_remaining,all_payments,count,date_from,date_to,account_paid=0,opening_balance=0}=d;
   return `<div id="spa">
   <div class="card" style="padding:18px;margin-bottom:12px;">
     <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;">
@@ -5706,7 +5729,7 @@ function supRepHTML(d){
       <div class="stat"><div style="font-size:12px;color:#64748b;">عدد الفواتير</div><div style="font-size:18px;font-weight:800;color:#60a5fa;margin-top:4px;">${count}</div></div>
       <div class="stat"><div style="font-size:12px;color:#64748b;">إجمالي المشتريات</div><div style="font-size:18px;font-weight:800;color:#f1f5f9;margin-top:4px;">${total.toLocaleString()} ${cur()}</div></div>
       <div class="stat"><div style="font-size:12px;color:#64748b;">إجمالي المدفوع</div><div style="font-size:18px;font-weight:800;color:#52b788;margin-top:4px;">${(total_paid||0).toLocaleString()} ${cur()}</div>${account_paid>0?`<div style="font-size:10px;color:#94a3b8;margin-top:2px;">منها ${account_paid.toLocaleString()} ${cur()} دفعات مباشرة</div>`:''}</div>
-      <div class="stat"><div style="font-size:12px;color:#64748b;">المتبقي (مستحق)</div><div style="font-size:18px;font-weight:800;color:${(total_remaining||0)>0?'#f87171':'#52b788'};margin-top:4px;">${(total_remaining||0).toLocaleString()} ${cur()}</div></div>
+      <div class="stat"><div style="font-size:12px;color:#64748b;">المتبقي (مستحق)</div><div style="font-size:18px;font-weight:800;color:${(total_remaining||0)>0?'#f87171':'#52b788'};margin-top:4px;">${(total_remaining||0).toLocaleString()} ${cur()}</div>${opening_balance?`<div style="font-size:10px;color:#94a3b8;margin-top:2px;">شامل ${opening_balance.toLocaleString()} ${cur()} رصيد افتتاحي</div>`:''}</div>
     </div>
   </div>
   ${ps.map(p=>`
@@ -6633,10 +6656,17 @@ function entModal(item){
   <div id="merr"></div>
   <div class="g2">
     ${[['name','الاسم *'],['contact','جهة الاتصال'],['phone','الهاتف'],
-       ['email','البريد'],['city','المدينة'],['balance','الرصيد']].map(([k,l])=>`
+       ['email','البريد'],['city','المدينة']].map(([k,l])=>`
     <div><label class="lbl">${l}</label>
-      <input class="inp" id="ef${k}" type="${k==='balance'?'number':'text'}" value="${item[k]??''}"/>
+      <input class="inp" id="ef${k}" type="text" value="${item[k]??''}"/>
     </div>`).join('')}
+    <div style="grid-column:span 2">
+      <label class="lbl">الرصيد الافتتاحي</label>
+      <input class="inp" id="efbalance" type="number" step="0.01" value="${item.balance??0}"/>
+      <div style="font-size:11px;color:#64748b;margin-top:4px;">
+        مبلغ سابق قبل استخدام النظام — قيمة موجبة تُضاف للمستحق الحالي، وقيمة سالبة تُعتبر رصيداً دائناً يُخصم من المستحق. اتركه 0 إن لم يوجد رصيد سابق.
+      </div>
+    </div>
     <div style="grid-column:span 2"><label class="lbl">ملاحظات</label>
       <textarea class="inp" id="efnotes" style="min-height:60px;">${item.notes||''}</textarea>
     </div>
