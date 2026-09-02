@@ -7376,7 +7376,7 @@ let _svcParts = [];
 function serviceFormModal(item){
   const isEdit = !!item.id;
   const today = new Date().toISOString().slice(0,10);
-  if(!isEdit || !MS._svcPartsInit){
+  if(!MS._svcPartsInit){
     _svcParts = (item.parts||[]).map(p=>({product_id:p.product_id, name:p.product_name, qty:p.qty, price:p.price}));
     MS._svcPartsInit = true;
   }
