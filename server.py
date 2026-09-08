@@ -1935,6 +1935,18 @@ def handle_api(method, path, body, req):
             for oi in old_items:
                 ProductsDAO.update_stock(c, oi["product_id"], oi["qty"])
             ProductUnitsDAO.unsold_by_sale(c, sid)
+
+            # التحقق من توفر السيريالات (بعد تحرير سيريالات هذه الفاتورة نفسها أعلاه) قبل أي تعديل نهائي
+            for i in items:
+                serials = [s.strip() for s in i.get("serials", []) if str(s).strip()]
+                if not serials: continue
+                if len(serials) != i["qty"]:
+                    c.close(); return 400, {"detail": f"عدد السيريالات لا يطابق الكمية للمنتج #{i['product_id']}"}
+                for s in serials:
+                    u = ProductUnitsDAO.get_by_serial(c, s)
+                    if not u or str(u.get("product_id")) != str(i["product_id"]) or u["status"] != "in_stock":
+                        c.close(); return 400, {"detail": f"السيريال {s} غير متاح للبيع"}
+
             SalesDAO.delete_items(c, sid)
             SalesDAO.update(c, sid, body.get("customer_id"), body.get("date",""), body.get("status","مدفوع"),
                             body.get("pay_method","نقدي"), body.get("notes",""), total, invoice_discount)
@@ -8296,6 +8308,10 @@ function bindModal(){
       if(!pid){ alert('اختر منتجاً'); return; }
       const prod  = products.find(x=>x.id===pid);
       if(!prod) return;
+      if(prod.track_serial){
+        alert('⚠️ هذا المنتج يتطلب اختيار سيريال محدَّد ولا يمكن إضافته من نموذج التعديل المبسَّط.\nيرجى حذف الفاتورة وإعادة إنشائها من نقطة البيع لاختيار السيريال بشكل صحيح.');
+        return;
+      }
       // إزالة الصنف القديم إن وجد ثم إعادة إضافته
       document.getElementById('esi-row-'+pid)?.remove();
       const tbody = document.getElementById('es-items-body');
@@ -8321,7 +8337,7 @@ function bindModal(){
       const payEl  = document.getElementById('es-pay');
       const stEl   = document.getElementById('es-status');
       const notEl  = document.getElementById('es-notes');
-      // جمع الأصناف من الجدول
+      // جمع الأصناف من الجدول (مع إعادة إرسال السيريالات الأصلية المحفوظة لكل صنف متتبَّع، لمنع عودتها "متوفرة" خطأً بالمخزون)
       const rows = document.querySelectorAll('#es-items-body tr');
       const items = [];
       rows.forEach(row=>{
@@ -8329,7 +8345,9 @@ function bindModal(){
         const qtyEl = row.querySelector('[id^="esq-"]');
         const prEl  = row.querySelector('[id^="esp-"]');
         if(!pid||!qtyEl||!prEl) return;
-        items.push({ product_id:pid, qty:parseInt(qtyEl.value)||1, price:parseFloat(prEl.value)||0 });
+        const serialsAttr = row.dataset.serials || '';
+        const serials = serialsAttr ? serialsAttr.split(',').filter(Boolean) : [];
+        items.push({ product_id:pid, qty:parseInt(qtyEl.value)||1, price:parseFloat(prEl.value)||0, serials });
       });
       if(!items.length){ errEl.innerHTML='<div class="err">أضف صنفاً واحداً على الأقل</div>'; return; }
       try{
@@ -9462,16 +9480,21 @@ window.openEditSale = async function(id){
 
 function editSaleModal(s){
   const custOpts = customers.map(c=>`<option value="${c.id}"${parseInt(s.customer_id)===c.id?' selected':''}>${c.name}</option>`).join('');
-  const itemRows = (s.items||[]).map(item=>`
-  <tr id="esi-row-${item.product_id}">
-    <td style="font-weight:600;color:#f1f5f9;font-size:13px;">${item.product_name||products.find(x=>x.id===item.product_id)?.name||'—'}</td>
-    <td><input class="inp" type="number" min="1" value="${item.qty}" id="esq-${item.product_id}" style="width:65px;padding:4px 7px;"/></td>
+  const itemRows = (s.items||[]).map(item=>{
+    const serials = item.serials_str ? String(item.serials_str).split(',').filter(Boolean) : [];
+    const hasSerials = serials.length>0;
+    return `
+  <tr id="esi-row-${item.product_id}" data-serials="${serials.join(',')}">
+    <td style="font-weight:600;color:#f1f5f9;font-size:13px;">${esc(item.product_name||products.find(x=>x.id===item.product_id)?.name||'—')}
+      ${hasSerials?`<div style="font-size:10px;color:#52b788;font-family:monospace;margin-top:2px;">📟 ${serials.map(esc).join(' ، ')}</div>`:''}
+    </td>
+    <td><input class="inp" type="number" min="1" value="${item.qty}" id="esq-${item.product_id}" style="width:65px;padding:4px 7px;" ${hasSerials?'disabled title="لا يمكن تغيير كمية صنف مرتبط بسيريال من هنا"':''}/></td>
     <td><input class="inp" type="number" min="0" step="0.01" value="${item.price}" id="esp-${item.product_id}" style="width:85px;padding:4px 7px;"/></td>
     <td style="color:#52b788;font-weight:700;">${((item.qty||0)*(item.price||0)).toLocaleString()} ${cur()}</td>
     <td><button class="btn d" style="padding:3px 7px;" onclick="removeEsItem(${item.product_id})">🗑️</button></td>
-  </tr>`).join('');
+  </tr>`;}).join('');
 
-  const prodOpts = products.map(p=>`<option value="${p.id}" data-price="${p.sell_price}">${p.name} — ${p.barcode}</option>`).join('');
+  const prodOpts = products.map(p=>`<option value="${p.id}" data-price="${p.sell_price}" data-track="${p.track_serial?1:0}">${p.name} — ${p.barcode}${p.track_serial?' 📟':''}</option>`).join('');
 
   return `<div class="overlay" id="mover"><div class="modal" style="max-width:720px;">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
@@ -9513,6 +9536,9 @@ function editSaleModal(s){
       <input class="inp" type="number" id="es-qty" placeholder="الكمية" value="1" min="1" style="width:70px;font-size:13px;"/>
       <input class="inp" type="number" id="es-price" placeholder="السعر" step="0.01" style="width:85px;font-size:13px;"/>
       <button class="btn p" id="es-add-btn" style="white-space:nowrap;font-size:13px;">+ إضافة</button>
+    </div>
+    <div style="font-size:11px;color:#fbbf24;margin-top:6px;">
+      ⚠️ لا يمكن إضافة منتج متتبَّع بسيريال (📟) من هنا — لاختيار سيريال محدَّد، احذف الفاتورة وأعد إنشاءها من نقطة البيع.
     </div>
   </div>
 
