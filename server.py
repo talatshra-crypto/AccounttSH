@@ -723,6 +723,9 @@ class ProductUnitsDAO(BaseDAO):
     def unsold_by_sale(c, sale_id):
         c.execute("UPDATE product_units SET status='in_stock', sale_id=NULL WHERE sale_id=?", (sale_id,))
     @staticmethod
+    def mark_in_stock_by_serial(c, serial):
+        c.execute("UPDATE product_units SET status='in_stock', sale_id=NULL WHERE serial=?", (serial,))
+    @staticmethod
     def delete_by_purchase(c, pid, status="in_stock"):
         c.execute("DELETE FROM product_units WHERE purchase_id=? AND status=?", (pid, status))
     @staticmethod
@@ -2490,6 +2493,58 @@ def handle_api(method, path, body, req):
         c.commit()
         ret = PurchasesDAO.get_by_id(c, ret_id)
         ret["items"] = PurchasesDAO.get_items(c, ret_id)
+        c.close(); return 201, ret
+
+    # ── SALE RETURN (مردود مبيعات من الزبون) ──
+    if ep == "sale_return" and method == "POST":
+        sid   = body.get("sale_id")
+        items = body.get("items", [])
+        notes = body.get("notes", "")
+        date  = body.get("date", "")
+        if not sid:
+            c.close(); return 400, {"detail":"يجب تحديد الفاتورة الأصلية"}
+        if not items:
+            c.close(); return 400, {"detail":"يجب تحديد صنف واحد على الأقل للإرجاع"}
+        orig_sale = SalesDAO.get_by_id(c, sid)
+        if not orig_sale:
+            c.close(); return 404, {"detail":"الفاتورة الأصلية غير موجودة"}
+
+        # التحقق: كمية كل صنف مُرجَع لا تتجاوز الكمية المباعة أصلاً بنفس الفاتورة
+        orig_items_map = {}
+        for oi in orig_sale.get("items", []):
+            orig_items_map[oi["product_id"]] = orig_items_map.get(oi["product_id"], 0) + oi["qty"]
+        for i in items:
+            sold_qty = orig_items_map.get(i["product_id"], 0)
+            if i["qty"] > sold_qty:
+                c.close(); return 400, {"detail": f"الكمية المُرجَعة أكبر من الكمية المباعة أصلاً للمنتج #{i['product_id']}"}
+
+        # التحقق من السيريالات: يجب أن تكون "مباعة" ومرتبطة بهذه الفاتورة تحديداً (وليس أي فاتورة أخرى)
+        for i in items:
+            prod = ProductsDAO.get_by_id(c, i["product_id"])
+            if prod and prod.get("track_serial"):
+                given = [str(s).strip() for s in i.get("serials", []) if str(s).strip()]
+                if len(given) != i["qty"]:
+                    c.close(); return 400, {"detail": f"يجب تحديد {i['qty']} سيريال للمنتج {prod['name']}"}
+                for s in given:
+                    unit = ProductUnitsDAO.get_by_serial(c, s)
+                    if not unit or str(unit.get("product_id")) != str(i["product_id"]):
+                        c.close(); return 400, {"detail": f"السيريال {s} لا يتبع هذا المنتج"}
+                    if unit.get("status") != "sold" or str(unit.get("sale_id")) != str(sid):
+                        c.close(); return 400, {"detail": f"السيريال {s} غير مرتبط بهذه الفاتورة أو غير قابل للإرجاع"}
+
+        total = sum(i["qty"] * i["price"] for i in items)
+        cust_id = orig_sale.get("customer_id")
+        ret_id = SalesDAO.create(c, cust_id, date, "مردود", "إرجاع", f"مردود من فاتورة #{sid} - {notes}", -total, 0)
+        for i in items:
+            SalesDAO.create_item(c, ret_id, i["product_id"], i["qty"], i["price"], 0, None)
+            ProductsDAO.update_stock(c, i["product_id"], i["qty"])  # إعادة للمخزون (عكس اتجاه البيع)
+            prod = ProductsDAO.get_by_id(c, i["product_id"])
+            if prod and prod.get("track_serial"):
+                given = [str(s).strip() for s in i.get("serials", []) if str(s).strip()]
+                for s in given:
+                    ProductUnitsDAO.mark_in_stock_by_serial(c, s)
+        c.commit()
+        ret = SalesDAO.get_by_id(c, ret_id)
         c.close(); return 201, ret
 
     c.close()
@@ -6081,6 +6136,7 @@ function modalHTML(){
   if(MS.type==='purform')  return purModal();
   if(MS.type==='editpur')  return editPurModal(MS.data||{});
   if(MS.type==='retpur')   return returnPurModal(MS.data||{});
+  if(MS.type==='returnsale') return returnSaleModal(MS.data||{});
   if(MS?.type==='payform') return payModal(MS.data||{});
   if(MS?.type==='payhist') return payHistModal(MS.data||{});
   if(MS.type==='userform') return userModal(MS.data||{});
@@ -7143,6 +7199,70 @@ function returnPurModal(p){
         </tr>`).join('')}
       </tbody>
     </table>
+  </div>
+  <div style="display:flex;gap:10px;">
+    <button class="btn p" style="background:linear-gradient(135deg,#b45309,#92400e);" id="ms">↩️ تأكيد المردود</button>
+    <button class="btn s" id="mc2">إلغاء</button>
+  </div>
+  </div></div>`;
+}
+
+// ── مودال مردود المبيعات (إرجاع من الزبون) — يدعم اختيار السيريال المحدَّد للمنتجات المتتبَّعة ──
+window.returnSale = function(id){
+  const s = sales.find(x=>x.id===id);
+  if(!s){ alert('الفاتورة غير موجودة'); return; }
+  if(!(s.items||[]).length){ alert('لا توجد أصناف في هذه الفاتورة'); return; }
+  if(s.status==='مردود'){ alert('هذه فاتورة مردود بالفعل ولا يمكن إرجاعها'); return; }
+  MS = {type:'returnsale', data:s};
+  render();
+};
+
+function returnSaleModal(s){
+  const items = groupInvoiceItems(s.items||[]);
+  const custName = s.customer_id ? (customers.find(c=>c.id===parseInt(s.customer_id))?.name||'—') : 'زبون عام';
+  return `<div class="overlay" id="mover"><div class="modal" style="max-width:680px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+    <div style="font-size:16px;font-weight:700;color:#fbbf24;">↩️ مردود مبيعات — فاتورة #${s.id}</div>
+    <button class="btn s" style="padding:4px 9px;" id="mc">✕</button>
+  </div>
+  <div id="merr"></div>
+  <div style="background:#1a1d27;border:1px solid #5c4a23;border-radius:8px;padding:12px;margin-bottom:14px;">
+    <div style="font-size:13px;color:#fbbf24;margin-bottom:4px;">ℹ️ تفاصيل الفاتورة الأصلية</div>
+    <div style="font-size:13px;color:#94a3b8;">الزبون: ${esc(custName)} | التاريخ: ${s.date} | الإجمالي: ${(s.total||0).toLocaleString()} ${cur()}</div>
+  </div>
+  <div class="g2" style="margin-bottom:14px;">
+    <div><label class="lbl">تاريخ المردود</label>
+      <input class="inp" type="date" id="sret-date" value="${new Date().toISOString().slice(0,10)}"/>
+    </div>
+    <div><label class="lbl">ملاحظات</label>
+      <input class="inp" id="sret-notes" placeholder="سبب المردود..."/>
+    </div>
+  </div>
+  <div style="font-size:13px;font-weight:700;color:#f1f5f9;margin-bottom:10px;">اختر الأصناف المرتجعة:</div>
+  <div class="card" style="margin-bottom:14px;padding:12px;">
+    ${items.map(item=>{
+      const prod = products.find(p=>p.id===item.product_id);
+      const hasSerials = item.serials && item.serials.length;
+      return `<div style="padding:10px 0;border-bottom:1px solid #1e2537;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <span style="font-weight:700;color:#f1f5f9;">${esc(item.product_name||prod?.name||('منتج #'+item.product_id))}</span>
+          <span style="color:#52b788;">${(item.price||0).toLocaleString()} ${cur()} / وحدة</span>
+        </div>
+        ${hasSerials ? `
+        <div style="font-size:12px;color:#64748b;margin-bottom:6px;">📟 اختر السيريالات المُرجَعة (من أصل ${item.qty} مباعة بهذه الفاتورة):</div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;">
+          ${item.serials.map(serial=>`
+            <label style="display:flex;align-items:center;gap:5px;background:#161923;border:1px solid #2d3349;border-radius:6px;padding:5px 10px;cursor:pointer;font-size:12px;font-family:monospace;color:#cbd5e1;">
+              <input type="checkbox" class="sret-serial-cb" data-product="${item.product_id}" data-serial="${esc(serial)}" data-price="${item.price}" style="width:14px;height:14px;accent-color:#b45309;"/>
+              ${esc(serial)}
+            </label>`).join('')}
+        </div>` : `
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span style="font-size:12px;color:#94a3b8;">الكمية المباعة: ${item.qty}</span>
+          <input class="inp sret-qty" data-product="${item.product_id}" data-price="${item.price}" type="number" value="0" min="0" max="${item.qty}" style="width:80px;padding:4px 8px;"/>
+        </div>`}
+      </div>`;
+    }).join('')}
   </div>
   <div style="display:flex;gap:10px;">
     <button class="btn p" style="background:linear-gradient(135deg,#b45309,#92400e);" id="ms">↩️ تأكيد المردود</button>
@@ -8424,6 +8544,45 @@ function bindModal(){
     };
   }
 
+  // ── مردود مبيعات (إرجاع من الزبون) ──
+  if(MS?.type==='returnsale'){
+    document.getElementById('ms').onclick=async()=>{
+      const errEl = document.getElementById('merr');
+      const s     = MS.data||{};
+      const date  = document.getElementById('sret-date')?.value||new Date().toISOString().slice(0,10);
+      const notes = document.getElementById('sret-notes')?.value||'';
+      const itemsMap = {};
+
+      // الأصناف المتتبَّعة بسيريال: كل تشيك بوكس مُحدَّد يمثل قطعة واحدة مُرجَعة
+      document.querySelectorAll('.sret-serial-cb:checked').forEach(cb=>{
+        const pid   = parseInt(cb.dataset.product);
+        const price = parseFloat(cb.dataset.price);
+        if(!itemsMap[pid]) itemsMap[pid] = {product_id:pid, qty:0, price, serials:[]};
+        itemsMap[pid].qty += 1;
+        itemsMap[pid].serials.push(cb.dataset.serial);
+      });
+
+      // الأصناف العادية (غير مسلسلة): كمية رقمية
+      document.querySelectorAll('.sret-qty').forEach(inp=>{
+        const qty = parseInt(inp.value)||0;
+        if(qty>0){
+          const pid   = parseInt(inp.dataset.product);
+          const price = parseFloat(inp.dataset.price);
+          itemsMap[pid] = {product_id:pid, qty, price, serials:[]};
+        }
+      });
+
+      const items = Object.values(itemsMap);
+      if(!items.length){ errEl.innerHTML = '<div class="err">حدد صنفاً واحداً على الأقل للإرجاع</div>'; return; }
+
+      try{
+        await api('POST','/api/sale_return', {sale_id: s.id, date, notes, items});
+        await loadAll(); closeM();
+        alert('✅ تم تسجيل مردود المبيعات بنجاح');
+      }catch(e){ errEl.innerHTML = '<div class="err">'+e.message+'</div>'; }
+    };
+  }
+
   // ── مودال المستخدم ──
   if(MS?.type==='userform'){
     const isEdit = !!MS.data?.id;
@@ -9441,17 +9600,19 @@ function salesListModal(){
       const custName = s.customer_id ? (customers.find(c=>c.id===parseInt(s.customer_id))?.name||'—') : 'زبون عام';
       const paid = s.paid||0;
       const rem  = Math.max(0,(s.total||0)-paid);
+      const isReturn = s.status==='مردود';
       return `<tr>
         <td style="color:#64748b;">#${s.id}</td>
         <td style="font-weight:600;">${s.date}</td>
         <td style="color:#52b788;font-weight:600;">${custName}</td>
-        <td style="font-weight:700;">${(s.total||0).toLocaleString()} ${cur()}</td>
+        <td style="font-weight:700;color:${isReturn?'#fbbf24':'#f1f5f9'};">${(s.total||0).toLocaleString()} ${cur()}</td>
         <td style="color:#52b788;">${paid.toLocaleString()} ${cur()}</td>
         <td style="color:${rem>0?'#f87171':'#52b788'};">${rem.toLocaleString()} ${cur()}</td>
-        <td><span class="badge ${s.status==='مدفوع'?'g':s.status==='مدفوع جزئياً'?'b':'y'}">${s.status}</span></td>
-        <td><div style="display:flex;gap:4px;">
-          <button class="btn s" style="padding:3px 8px;font-size:11px;" onclick="openEditSale(${s.id})">✏️ تعديل</button>
-          <button class="btn p" style="padding:3px 8px;font-size:11px;background:linear-gradient(135deg,#1e40af,#1e3a8a);" onclick="openPay(${s.id},'sale')">💳</button>
+        <td><span class="badge ${isReturn?'y':s.status==='مدفوع'?'g':s.status==='مدفوع جزئياً'?'b':'y'}">${s.status}</span></td>
+        <td><div style="display:flex;gap:4px;flex-wrap:wrap;">
+          ${!isReturn?`<button class="btn s" style="padding:3px 8px;font-size:11px;" onclick="openEditSale(${s.id})">✏️ تعديل</button>`:''}
+          ${!isReturn?`<button class="btn p" style="padding:3px 8px;font-size:11px;background:linear-gradient(135deg,#1e40af,#1e3a8a);" onclick="openPay(${s.id},'sale')">💳</button>`:''}
+          ${!isReturn?`<button class="btn s" style="padding:3px 8px;font-size:11px;color:#fbbf24;border-color:#5c4a23;" onclick="returnSale(${s.id})">↩️ مردود</button>`:''}
           <button class="btn d" style="padding:3px 8px;font-size:11px;" onclick="deleteSale(${s.id})">🗑️</button>
         </div></td>
       </tr>`;
