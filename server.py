@@ -3356,13 +3356,7 @@ window.togPur=function(id){
   if(r) r.style.display=r.style.display==='none'?'table-row':'none';
 };
 
-// تعديل فاتورة شراء
-window.editPur=function(id){
-  const p=purchases.find(x=>x.id===id);
-  if(!p){alert('الفاتورة غير موجودة');return;}
-  MS={type:'editpur', data:JSON.parse(JSON.stringify(p))};
-  render();
-};
+// (ملاحظة: تعديل فاتورة الشراء يُفتح عبر window.editPur المعرَّفة لاحقاً بالملف، والتي تُهيّئ السلة بشكل صحيح مع استعادة السيريالات)
 
 // مردود مشتريات
 window.returnPur=function(id){
@@ -8860,7 +8854,8 @@ window.editPur = function(id){
     name: i.product_name || products.find(x=>x.id===i.product_id)?.name || '—',
     qty: i.qty,
     price: i.price,
-    serials: []  // السيريالات الأصلية للفاتورة لا تُستعاد هنا؛ الأصناف المسلسلة الجديدة فقط تتطلب سيريال
+    // نستعيد السيريالات الأصلية المرتبطة بهذا الصنف بهذه الفاتورة تحديداً، حتى لا تُحذف عند حفظ أي تعديل آخر (كتعديل السعر مثلاً)
+    serials: i.serials_str ? String(i.serials_str).split(',').filter(Boolean) : []
   }));
   MS = {type:'editpur', editId:id, data:p};
   render();
