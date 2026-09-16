@@ -731,6 +731,21 @@ class ProductUnitsDAO(BaseDAO):
     @staticmethod
     def unpin_purchase(c, pid):
         c.execute("UPDATE product_units SET purchase_id=NULL WHERE purchase_id=?", (pid,))
+    @staticmethod
+    def delete_by_serial(c, serial):
+        c.execute("DELETE FROM product_units WHERE serial=?", (serial,))
+    @staticmethod
+    def search(c, q):
+        q_like = f"%{q}%"
+        return BaseDAO.rows(c.execute("""
+            SELECT pu.*, p.name AS product_name, p.barcode, p.unit AS product_unit,
+                   p.sell_price, p.buy_price
+            FROM product_units pu
+            LEFT JOIN products p ON p.id = pu.product_id
+            WHERE pu.serial LIKE ?
+            ORDER BY pu.id DESC
+            LIMIT 100
+        """, (q_like,)))
 
 class PurchasesDAO(BaseDAO):
     @staticmethod
@@ -1749,6 +1764,39 @@ def handle_api(method, path, body, req):
 
     # ── PRODUCT UNITS (سيريال فريد لكل قطعة) ──
     if ep == "units":
+        if method == "GET" and len(parts) == 3 and parts[2] == "search":
+            q = qs.get("q",[""])[0].strip()
+            if not q or len(q) < 2:
+                c.close(); return 200, []
+            results = ProductUnitsDAO.search(c, q)
+            for r in results:
+                r["purchase_info"] = None
+                r["sale_info"] = None
+                if r.get("purchase_id"):
+                    pur = PurchasesDAO.get_by_id(c, r["purchase_id"])
+                    if pur:
+                        sup = SuppliersDAO.get_by_id(c, pur.get("supplier_id")) if pur.get("supplier_id") else None
+                        pi = BaseDAO.row1(c.execute(
+                            "SELECT price FROM purchase_items WHERE purchase_id=? AND product_id=? LIMIT 1",
+                            (r["purchase_id"], r["product_id"])))
+                        r["purchase_info"] = {
+                            "purchase_id": r["purchase_id"], "date": pur.get("date"),
+                            "supplier_name": sup.get("name") if sup else "—",
+                            "price": pi["price"] if pi else r.get("buy_price") or 0
+                        }
+                if r.get("sale_id"):
+                    sale = SalesDAO.get_by_id(c, r["sale_id"])
+                    if sale:
+                        cust = CustomersDAO.get_by_id(c, sale.get("customer_id")) if sale.get("customer_id") else None
+                        si = BaseDAO.row1(c.execute(
+                            "SELECT price FROM sale_items WHERE sale_id=? AND product_id=? LIMIT 1",
+                            (r["sale_id"], r["product_id"])))
+                        r["sale_info"] = {
+                            "sale_id": r["sale_id"], "date": sale.get("date"),
+                            "customer_name": cust.get("name") if cust else "زبون عام",
+                            "price": si["price"] if si else r.get("sell_price") or 0
+                        }
+            c.close(); return 200, results
         if method == "GET" and len(parts) == 2:
             product_id = qs.get("product_id",[""])[0]
             status_f   = qs.get("status",[""])[0]
@@ -1776,6 +1824,22 @@ def handle_api(method, path, body, req):
                 ProductsDAO.update_stock(c, product_id, len(added))
             c.commit(); c.close()
             return 201, {"added": added, "duplicated": dup}
+        if method == "PUT" and len(parts) == 3:
+            uid = int(parts[2])
+            u_row = BaseDAO.row1(c.execute("SELECT * FROM product_units WHERE id=?", (uid,)))
+            if not u_row: c.close(); return 404, {"detail":"غير موجود"}
+            new_serial = body.get("serial","").strip()
+            new_notes  = body.get("notes", u_row.get("notes","") or "")
+            if not new_serial:
+                c.close(); return 400, {"detail":"السيريال مطلوب"}
+            if new_serial != u_row["serial"]:
+                existing = ProductUnitsDAO.get_by_serial(c, new_serial)
+                if existing:
+                    c.close(); return 400, {"detail":"هذا السيريال مستخدم مسبقاً لوحدة أخرى"}
+            c.execute("UPDATE product_units SET serial=?, notes=? WHERE id=?", (new_serial, new_notes, uid))
+            c.commit()
+            r = BaseDAO.row1(c.execute("SELECT * FROM product_units WHERE id=?", (uid,)))
+            c.close(); return 200, r
         if method == "DELETE" and len(parts) == 3:
             uid = int(parts[2])
             u = ProductUnitsDAO.get_by_serial(c, uid) or ProductsDAO.get_by_id(c, uid)
@@ -2484,12 +2548,32 @@ def handle_api(method, path, body, req):
         items = body.get("items", [])
         notes = body.get("notes", "")
         date  = body.get("date", "")
+
+        # التحقق من السيريالات: يجب أن تكون "متوفرة بالمخزون" (لم تُبَع بعد) لإمكانية إرجاعها للمورد
+        for i in items:
+            prod = ProductsDAO.get_by_id(c, i["product_id"])
+            if prod and prod.get("track_serial"):
+                given = [str(s).strip() for s in i.get("serials", []) if str(s).strip()]
+                if len(given) != i["qty"]:
+                    c.close(); return 400, {"detail": f"يجب تحديد {i['qty']} سيريال للمنتج {prod['name']}"}
+                for s in given:
+                    unit = ProductUnitsDAO.get_by_serial(c, s)
+                    if not unit or str(unit.get("product_id")) != str(i["product_id"]):
+                        c.close(); return 400, {"detail": f"السيريال {s} لا يتبع هذا المنتج"}
+                    if unit.get("status") != "in_stock":
+                        c.close(); return 400, {"detail": f"السيريال {s} مباع بالفعل ولا يمكن إرجاعه للمورد مباشرة"}
+
         total = sum(i["qty"] * i["price"] for i in items)
         sup_id = PurchasesDAO.get_supplier_id(c, pid)
         ret_id = PurchasesDAO.create(c, sup_id, date, "مردود", f"مردود من فاتورة #{pid} - {notes}", -total)
         for i in items:
             PurchasesDAO.create_item(c, ret_id, i["product_id"], i["qty"], i["price"])
             ProductsDAO.update_stock(c, i["product_id"], -i["qty"])
+            prod = ProductsDAO.get_by_id(c, i["product_id"])
+            if prod and prod.get("track_serial"):
+                given = [str(s).strip() for s in i.get("serials", []) if str(s).strip()]
+                for s in given:
+                    ProductUnitsDAO.delete_by_serial(c, s)  # القطعة تغادر مخزوننا فعلياً برجوعها للمورد
         c.commit()
         ret = PurchasesDAO.get_by_id(c, ret_id)
         ret["items"] = PurchasesDAO.get_items(c, ret_id)
@@ -3240,7 +3324,10 @@ function renderProds(q=''){
 function warehouseHTML(){
   const cats=[...new Set(products.map(p=>p.category||'غير مصنف'))];
   const tv=products.reduce((s,p)=>s+p.stock*p.buy_price,0);
-  return `<div class="ti">المخازن</div><div class="sub">تفاصيل المخزون الحالي</div>
+  return `<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+    <div><div class="ti">المخازن</div><div class="sub">تفاصيل المخزون الحالي</div></div>
+    <button class="btn p" onclick="openSerialSearch()">🔍 بحث عن سيريال</button>
+  </div>
   <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:20px;">
     <div class="stat"><div style="font-size:13px;color:#64748b;">اجمالي المنتجات</div><div style="font-size:24px;font-weight:800;color:#52b788;margin-top:7px;">${products.length}</div></div>
     <div class="stat"><div style="font-size:13px;color:#64748b;">اجمالي الوحدات</div><div style="font-size:24px;font-weight:800;color:#60a5fa;margin-top:7px;">${products.reduce((s,p)=>s+p.stock,0).toLocaleString()}</div></div>
@@ -6141,6 +6228,8 @@ function modalHTML(){
   if(MS.type==='editpayment') return editPaymentModal(MS.data||{});
   if(MS.type==='done')     return doneModal(MS.data);
   if(MS.type==='unitpicker') return unitPickerModal(MS.data||{});
+  if(MS.type==='serialsearch') return serialSearchModal(MS.data||{});
+  if(MS.type==='editunit') return editUnitModal(MS.data||{});
   if(MS.type==='camerascan') return cameraScanModal();
   if(MS.type==='serialsentry') return serialsEntryModal(MS.data||{});
   if(MS.type==='serviceform') return serviceFormModal(MS.data||{});
@@ -6886,6 +6975,173 @@ window.pickUnit = function(unitId){
   document.getElementById('pi')?.focus();
 };
 
+// ══════════════════════════════════════════════
+//  بحث السيريال الفريد (للمشتريات والمبيعات) — تعديل وإرجاع
+// ══════════════════════════════════════════════
+window.openSerialSearch = function(){
+  MS = {type:'serialsearch', data:{query:'', results:[], loading:false, searched:false}};
+  render();
+  setTimeout(()=>document.getElementById('sersearch-input')?.focus(), 50);
+};
+
+function serialSearchModal(d){
+  return `<div class="overlay" id="mover"><div class="modal" style="max-width:760px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+    <div>
+      <div style="font-size:16px;font-weight:800;color:#f1f5f9;">🔍 بحث عن سيريال</div>
+      <div style="font-size:12px;color:#64748b;margin-top:2px;">ابحث بجزء من رقم السيريال لعرض مصدره (شراء/بيع) مع إمكانية التعديل والإرجاع</div>
+    </div>
+    <button class="btn s" style="padding:4px 9px;" id="mc">✕</button>
+  </div>
+  <input class="inp" id="sersearch-input" placeholder="🔍 اكتب جزءاً من السيريال (حرفين على الأقل)..." value="${esc(d.query||'')}" style="margin-bottom:14px;height:44px;font-size:15px;" autocomplete="off" oninput="serSearchInput(this.value)"/>
+  <div id="sersearch-results">${serialSearchResultsHTML(d)}</div>
+  </div></div>`;
+}
+
+function serialSearchResultsHTML(d){
+  if(d.loading) return '<div style="text-align:center;padding:30px;"><div class="spin"></div></div>';
+  if(!d.searched) return '<div style="text-align:center;color:#64748b;padding:30px;font-size:13px;">ابدأ الكتابة لعرض النتائج...</div>';
+  if(!d.results.length) return '<div style="text-align:center;color:#64748b;padding:30px;font-size:13px;">لا توجد نتائج مطابقة</div>';
+  return `<div class="card" style="overflow:hidden;">
+    <table>
+      <thead><tr><th>السيريال</th><th>المنتج</th><th>الحالة</th><th>المصدر</th><th>إجراءات</th></tr></thead>
+      <tbody>
+      ${d.results.map(r=>{
+        const statusBadge = r.status==='sold' ? '<span class="badge r">مباع</span>' : '<span class="badge g">متوفر</span>';
+        let sourceHtml = '<span style="color:#475569;">—</span>';
+        if(r.status==='sold' && r.sale_info){
+          sourceHtml = `<div style="font-size:12px;">بيع فاتورة #${r.sale_info.sale_id}<div style="color:#94a3b8;">${esc(r.sale_info.customer_name)} — ${r.sale_info.date}</div></div>`;
+        } else if(r.purchase_info){
+          sourceHtml = `<div style="font-size:12px;">شراء فاتورة #${r.purchase_info.purchase_id}<div style="color:#94a3b8;">${esc(r.purchase_info.supplier_name)} — ${r.purchase_info.date}</div></div>`;
+        }
+        return `<tr>
+          <td style="font-family:monospace;font-weight:700;color:#52b788;">${esc(r.serial)}</td>
+          <td style="font-weight:600;color:#f1f5f9;">${esc(r.product_name)||('منتج #'+r.product_id)}<div style="font-size:11px;color:#64748b;font-family:monospace;">${esc(r.barcode)||''}</div></td>
+          <td>${statusBadge}</td>
+          <td>${sourceHtml}</td>
+          <td><div style="display:flex;gap:4px;flex-wrap:wrap;">
+            <button class="btn s" style="padding:3px 8px;font-size:11px;" onclick='openEditUnit(${JSON.stringify(r).replace(/'/g,"&#39;")})'>✏️ تعديل</button>
+            ${r.status==='in_stock' && r.purchase_info?`<button class="btn s" style="padding:3px 8px;font-size:11px;color:#fbbf24;border-color:#5c4a23;" onclick="returnUnitToSupplier(${r.id})">↩️ للمورد</button>`:''}
+            ${r.status==='sold' && r.sale_info?`<button class="btn s" style="padding:3px 8px;font-size:11px;color:#fbbf24;border-color:#5c4a23;" onclick="returnUnitFromCustomer(${r.id})">↩️ من الزبون</button>`:''}
+            ${r.status==='in_stock'?`<button class="btn d" style="padding:3px 8px;font-size:11px;" onclick="deleteUnitFromSearch(${r.id})">🗑️</button>`:''}
+          </div></td>
+        </tr>`;
+      }).join('')}
+      </tbody>
+    </table>
+  </div>`;
+}
+
+let _serSearchTimer = null;
+window.serSearchInput = function(val){
+  if(!MS || MS.type!=='serialsearch') return;
+  MS.data.query = val;
+  clearTimeout(_serSearchTimer);
+  if(!val || val.trim().length < 2){
+    MS.data.searched = false; MS.data.results = [];
+    const el = document.getElementById('sersearch-results');
+    if(el) el.innerHTML = serialSearchResultsHTML(MS.data);
+    return;
+  }
+  _serSearchTimer = setTimeout(async()=>{
+    if(!MS || MS.type!=='serialsearch') return;
+    MS.data.loading = true;
+    const el = document.getElementById('sersearch-results');
+    if(el) el.innerHTML = serialSearchResultsHTML(MS.data);
+    try{
+      const results = await api('GET','/api/units/search?q='+encodeURIComponent(val.trim()));
+      if(!MS || MS.type!=='serialsearch') return;
+      MS.data.results = results; MS.data.searched = true; MS.data.loading = false;
+    }catch(e){
+      MS.data.results = []; MS.data.searched = true; MS.data.loading = false;
+    }
+    const el2 = document.getElementById('sersearch-results');
+    if(el2) el2.innerHTML = serialSearchResultsHTML(MS.data);
+  }, 350);
+};
+
+// ── تعديل وحدة (سيريال/ملاحظات) ──
+window.openEditUnit = function(unit){
+  const prevSearch = (MS && MS.type==='serialsearch') ? MS.data : null;
+  MS = {type:'editunit', data: unit, _prevSearch: prevSearch};
+  render();
+};
+
+function editUnitModal(u){
+  return `<div class="overlay" id="mover"><div class="modal" style="max-width:440px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;">
+    <div style="font-size:16px;font-weight:700;color:#f1f5f9;">✏️ تعديل وحدة/سيريال</div>
+    <button class="btn s" style="padding:4px 9px;" id="mc">✕</button>
+  </div>
+  <div id="merr"></div>
+  <div style="margin-bottom:12px;">
+    <label class="lbl">المنتج</label>
+    <div style="color:#94a3b8;font-size:13px;">${esc(u.product_name)||('منتج #'+u.product_id)}</div>
+  </div>
+  <div style="margin-bottom:12px;">
+    <label class="lbl">السيريال</label>
+    <input class="inp" id="eu-serial" value="${esc(u.serial)}" style="font-family:monospace;"/>
+    ${u.status==='sold'?'<div style="font-size:11px;color:#fbbf24;margin-top:4px;">⚠️ هذه القطعة مباعة بالفعل — التعديل هنا يُصحّح الاسم فقط دون التأثير على حالتها</div>':''}
+  </div>
+  <div style="margin-bottom:16px;">
+    <label class="lbl">ملاحظات</label>
+    <textarea class="inp" id="eu-notes" style="min-height:60px;">${esc(u.notes)||''}</textarea>
+  </div>
+  <div style="display:flex;gap:10px;">
+    <button class="btn p" id="ms">💾 حفظ</button>
+    <button class="btn s" id="mc2">إلغاء</button>
+  </div>
+  </div></div>`;
+}
+
+// ── إرجاع قطعة "متوفرة" للمورد مباشرة من نتائج البحث ──
+window.returnUnitToSupplier = async function(unitId){
+  const d = MS?.data;
+  const r = (d?.results||[]).find(x=>x.id===unitId);
+  if(!r || !r.purchase_info) return;
+  if(!confirm(`إرجاع القطعة ${r.serial} للمورد "${r.purchase_info.supplier_name}"؟\nسيتم حذفها من المخزون فعلياً.`)) return;
+  try{
+    await api('POST','/api/purchase_return', {
+      purchase_id: r.purchase_info.purchase_id,
+      date: new Date().toISOString().slice(0,10),
+      notes: 'إرجاع من نافذة بحث السيريال',
+      items: [{product_id: r.product_id, qty:1, price: r.purchase_info.price, serials:[r.serial]}]
+    });
+    await loadAll();
+    alert('✅ تم إرجاع القطعة للمورد بنجاح');
+    serSearchInput(d.query);
+  }catch(e){ alert('خطأ: '+e.message); }
+};
+
+// ── إرجاع قطعة "مباعة" من الزبون مباشرة من نتائج البحث ──
+window.returnUnitFromCustomer = async function(unitId){
+  const d = MS?.data;
+  const r = (d?.results||[]).find(x=>x.id===unitId);
+  if(!r || !r.sale_info) return;
+  if(!confirm(`إرجاع القطعة ${r.serial} من الزبون "${r.sale_info.customer_name}"؟\nسيتم إعادتها للمخزون كمتوفرة.`)) return;
+  try{
+    await api('POST','/api/sale_return', {
+      sale_id: r.sale_info.sale_id,
+      date: new Date().toISOString().slice(0,10),
+      notes: 'إرجاع من نافذة بحث السيريال',
+      items: [{product_id: r.product_id, qty:1, price: r.sale_info.price, serials:[r.serial]}]
+    });
+    await loadAll();
+    alert('✅ تم إرجاع القطعة من الزبون بنجاح');
+    serSearchInput(d.query);
+  }catch(e){ alert('خطأ: '+e.message); }
+};
+
+window.deleteUnitFromSearch = async function(unitId){
+  if(!confirm('حذف هذه الوحدة نهائياً من المخزون؟')) return;
+  const d = MS?.data;
+  try{
+    await api('DELETE','/api/units/'+unitId);
+    await loadAll();
+    if(d) serSearchInput(d.query);
+  }catch(e){ alert('خطأ: '+e.message); }
+};
+
 // ── نافذة المسح عبر كاميرا الجوال (مكتبة ZXing — تعمل على كل المتصفحات بما فيها Safari/آيفون) ──
 function cameraScanModal(){
   const supported = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
@@ -7162,12 +7418,13 @@ function editPurModal(p){
 
 // ── modal مردود المشتريات ──
 function returnPurModal(p){
-  const items = p.items||[];
+  const items = groupInvoiceItems(p.items||[]);
   return `<div class="overlay" id="mover"><div class="modal" style="max-width:680px;">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
     <div style="font-size:16px;font-weight:700;color:#fbbf24;">↩️ مردود مشتريات — فاتورة #${p.id}</div>
     <button class="btn s" style="padding:4px 9px;" id="mc">✕</button>
   </div>
+  <div id="merr"></div>
   <div style="background:#1a1d27;border:1px solid #5c4a23;border-radius:8px;padding:12px;margin-bottom:14px;">
     <div style="font-size:13px;color:#fbbf24;margin-bottom:4px;">ℹ️ تفاصيل الفاتورة الأصلية</div>
     <div style="font-size:13px;color:#94a3b8;">المورد: ${suppliers.find(s=>parseInt(s.id)===parseInt(p.supplier_id))?.name||'—'} | التاريخ: ${p.date} | الإجمالي: ${(p.total||0).toLocaleString()} ${cur()}</div>
@@ -7180,19 +7437,30 @@ function returnPurModal(p){
       <input class="inp" id="ret-notes" placeholder="سبب المردود..."/>
     </div>
   </div>
-  <div style="font-size:13px;font-weight:700;color:#f1f5f9;margin-bottom:10px;">اختر الأصناف المرتجعة والكمية:</div>
-  <div class="card" style="margin-bottom:14px;">
-    <table>
-      <thead><tr><th>المنتج</th><th>الكمية المشتراة</th><th>كمية المردود</th><th>السعر</th></tr></thead>
-      <tbody>
-        ${items.map(item=>`<tr>
-          <td style="font-weight:600;color:#f1f5f9;">${item.product_name||'—'}</td>
-          <td style="color:#94a3b8;">${item.qty} ${item.unit||''}</td>
-          <td><input class="inp" type="number" id="rq-${item.product_id}" value="0" min="0" max="${item.qty}" style="width:80px;padding:4px 8px;"/></td>
-          <td style="color:#52b788;">${(item.price||0).toLocaleString()} ${cur()}</td>
-        </tr>`).join('')}
-      </tbody>
-    </table>
+  <div style="font-size:13px;font-weight:700;color:#f1f5f9;margin-bottom:10px;">اختر الأصناف المرتجعة:</div>
+  <div class="card" style="margin-bottom:14px;padding:12px;">
+    ${items.map(item=>{
+      const hasSerials = item.serials && item.serials.length;
+      return `<div style="padding:10px 0;border-bottom:1px solid #1e2537;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <span style="font-weight:700;color:#f1f5f9;">${esc(item.product_name||'—')}</span>
+          <span style="color:#52b788;">${(item.price||0).toLocaleString()} ${cur()} / وحدة</span>
+        </div>
+        ${hasSerials ? `
+        <div style="font-size:12px;color:#64748b;margin-bottom:6px;">📟 اختر السيريالات المُرجَعة للمورد (من أصل ${item.qty} بهذه الفاتورة، والمتاح إرجاعه فقط ما لم يُبَع بعد):</div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;">
+          ${item.serials.map(serial=>`
+            <label style="display:flex;align-items:center;gap:5px;background:#161923;border:1px solid #2d3349;border-radius:6px;padding:5px 10px;cursor:pointer;font-size:12px;font-family:monospace;color:#cbd5e1;">
+              <input type="checkbox" class="pret-serial-cb" data-product="${item.product_id}" data-serial="${esc(serial)}" data-price="${item.price}" style="width:14px;height:14px;accent-color:#b45309;"/>
+              ${esc(serial)}
+            </label>`).join('')}
+        </div>` : `
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span style="font-size:12px;color:#94a3b8;">الكمية المشتراة: ${item.qty}</span>
+          <input class="inp pret-qty" data-product="${item.product_id}" data-price="${item.price}" type="number" value="0" min="0" max="${item.qty}" style="width:80px;padding:4px 8px;"/>
+        </div>`}
+      </div>`;
+    }).join('')}
   </div>
   <div style="display:flex;gap:10px;">
     <button class="btn p" style="background:linear-gradient(135deg,#b45309,#92400e);" id="ms">↩️ تأكيد المردود</button>
@@ -7789,6 +8057,11 @@ function closeM(){
     render();
     return;
   }
+  if(MS?.type==='editunit' && MS._prevSearch){
+    MS = {type:'serialsearch', data: MS._prevSearch};
+    render();
+    return;
+  }
   MS=null; render();
   if(page==='accounting') refreshAccView();
 }
@@ -7797,6 +8070,28 @@ function bindModal(){
   document.getElementById('mover')?.addEventListener('click',e=>{if(e.target.id==='mover')closeM();});
   document.getElementById('mc')?.addEventListener('click',closeM);
   document.getElementById('mc2')?.addEventListener('click',closeM);
+
+  // ── تعديل وحدة/سيريال (من نافذة بحث السيريال) ──
+  if(MS?.type==='editunit'){
+    document.getElementById('ms').onclick = async()=>{
+      const errEl  = document.getElementById('merr');
+      const serial = document.getElementById('eu-serial')?.value?.trim()||'';
+      const notes  = document.getElementById('eu-notes')?.value||'';
+      if(!serial){ errEl.innerHTML = '<div class="err">السيريال مطلوب</div>'; return; }
+      try{
+        await api('PUT','/api/units/'+MS.data.id, {serial, notes});
+        await loadAll();
+        const prevSearch = MS._prevSearch;
+        if(prevSearch){
+          MS = {type:'serialsearch', data: {...prevSearch, results:[], searched:false}};
+          render();
+          if(prevSearch.query) serSearchInput(prevSearch.query);
+        } else {
+          closeM();
+        }
+      }catch(e){ errEl.innerHTML = '<div class="err">'+e.message+'</div>'; }
+    };
+  }
 
   if(MS?.type==='camerascan'){
     startCameraScan();
@@ -8518,23 +8813,40 @@ function bindModal(){
   // ── مردود مشتريات ──
   if(MS?.type==='retpur'){
     document.getElementById('ms').onclick=async()=>{
+      const errEl = document.getElementById('merr');
       const p     = MS.data||{};
       const date  = document.getElementById('ret-date')?.value||new Date().toISOString().slice(0,10);
       const notes = document.getElementById('ret-notes')?.value||'';
-      const retItems=[];
-      (p.items||[]).forEach(item=>{
-        const qtyEl=document.getElementById('rq-'+item.product_id);
-        const qty=parseInt(qtyEl?.value)||0;
-        if(qty>0) retItems.push({product_id:item.product_id,qty,price:item.price});
+      const itemsMap = {};
+
+      // الأصناف المتتبَّعة بسيريال: كل تشيك بوكس مُحدَّد يمثل قطعة واحدة مُرجَعة للمورد
+      document.querySelectorAll('.pret-serial-cb:checked').forEach(cb=>{
+        const pid   = parseInt(cb.dataset.product);
+        const price = parseFloat(cb.dataset.price);
+        if(!itemsMap[pid]) itemsMap[pid] = {product_id:pid, qty:0, price, serials:[]};
+        itemsMap[pid].qty += 1;
+        itemsMap[pid].serials.push(cb.dataset.serial);
       });
-      if(!retItems.length){alert('حدد كمية مردود لصنف واحد على الأقل');return;}
+
+      // الأصناف العادية (غير مسلسلة): كمية رقمية
+      document.querySelectorAll('.pret-qty').forEach(inp=>{
+        const qty = parseInt(inp.value)||0;
+        if(qty>0){
+          const pid   = parseInt(inp.dataset.product);
+          const price = parseFloat(inp.dataset.price);
+          itemsMap[pid] = {product_id:pid, qty, price, serials:[]};
+        }
+      });
+
+      const retItems = Object.values(itemsMap);
+      if(!retItems.length){ errEl.innerHTML = '<div class="err">حدد صنفاً واحداً على الأقل للإرجاع</div>'; return; }
       try{
         await api('POST','/api/purchase_return',{
           purchase_id:p.id, date, notes, items:retItems
         });
         await loadAll(); closeM();
         alert('تم تسجيل المردود بنجاح ✅');
-      }catch(e){alert('خطأ: '+e.message);}
+      }catch(e){ errEl.innerHTML = '<div class="err">'+e.message+'</div>'; }
     };
   }
 
