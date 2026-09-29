@@ -1358,6 +1358,22 @@ class BackupDAO(BaseDAO):
 
 class ReportsDAO(BaseDAO):
     @staticmethod
+    def _sup_movements(c, sup_id, date_from, date_to=None):
+        """حركات مورد ضمن نطاق تاريخ. إن لم يُمرَّر date_to فالنطاق = كل ما قبل date_from (للرصيد السابق).
+        يعيد: مشتريات (فواتير موجبة)، مردودات مشتريات (قيمة موجبة)، دفعات."""
+        if date_to is None: w, pr = "date<?", [date_from]
+        else:               w, pr = "date>=? AND date<=?", [date_from, date_to]
+        purchases, returns = c.execute(
+            f"SELECT COALESCE(SUM(CASE WHEN total>0 THEN total ELSE 0 END),0), "
+            f"COALESCE(SUM(CASE WHEN total<0 THEN -total ELSE 0 END),0) "
+            f"FROM purchases WHERE (CAST(supplier_id AS INTEGER)=? OR supplier_id=?) AND {w}",
+            [sup_id, str(sup_id)]+pr).fetchone()
+        payments = c.execute(
+            f"SELECT COALESCE(SUM(amount),0) FROM payments "
+            f"WHERE party_type='supplier' AND party_id=? AND {w}", [sup_id]+pr).fetchone()[0]
+        return {"purchases": purchases, "returns": returns, "payments": payments}
+
+    @staticmethod
     def supplier_report(c, sup_id, date_from, date_to):
         sup = SuppliersDAO.get_by_id(c, sup_id)
         if not sup: return None
@@ -1377,10 +1393,42 @@ class ReportsDAO(BaseDAO):
         total_paid_final = total_paid + account_paid
         total_remain = max(0, total_remain_inv + opening_balance - account_paid)
         all_payments = PaymentsDAO.get_by_party(c, "supplier", sup_id)
+        # الرصيد السابق (المستحق للمورد) = الرصيد الافتتاحي + مشتريات − مردودات − دفعات لكل ما قبل date_from
+        prev = ReportsDAO._sup_movements(c, sup_id, date_from)
+        previous_balance = opening_balance + prev["purchases"] - prev["returns"] - prev["payments"]
+        per = ReportsDAO._sup_movements(c, sup_id, date_from, date_to)
+        period_debit = per["purchases"]
+        period_credit = per["returns"] + per["payments"]
+        closing_balance = previous_balance + period_debit - period_credit
         return {"supplier": sup, "purchases": ps, "total": total_sup,
                 "total_paid": total_paid_final, "total_remaining": total_remain,
                 "account_paid": account_paid, "opening_balance": opening_balance, "all_payments": all_payments,
-                "date_from": date_from, "date_to": date_to, "count": len(ps)}
+                "date_from": date_from, "date_to": date_to, "count": len(ps),
+                "previous_balance": previous_balance, "period_debit": period_debit,
+                "period_returns": per["returns"], "period_payments": per["payments"],
+                "period_credit": period_credit, "closing_balance": closing_balance}
+
+    @staticmethod
+    def _cust_movements(c, cust_id, date_from, date_to=None):
+        """حركات زبون ضمن نطاق تاريخ. إن لم يُمرَّر date_to فالنطاق = كل ما قبل date_from (للرصيد السابق).
+        يعيد: مبيعات (فواتير موجبة)، خدمات، مردودات (قيمة موجبة)، دفعات."""
+        def rng(col):
+            if date_to is None: return f"{col}<?", [date_from]
+            return f"{col}>=? AND {col}<=?", [date_from, date_to]
+        w, pr = rng("date")
+        sales_pos, returns = c.execute(
+            f"SELECT COALESCE(SUM(CASE WHEN total>0 THEN total ELSE 0 END),0), "
+            f"COALESCE(SUM(CASE WHEN total<0 THEN -total ELSE 0 END),0) "
+            f"FROM sales WHERE CAST(customer_id AS INTEGER)=? AND {w}", [cust_id]+pr).fetchone()
+        w, pr = rng("received_date")
+        services = c.execute(
+            f"SELECT COALESCE(SUM(service_fee),0) FROM service_orders "
+            f"WHERE CAST(customer_id AS INTEGER)=? AND {w}", [cust_id]+pr).fetchone()[0]
+        w, pr = rng("date")
+        payments = c.execute(
+            f"SELECT COALESCE(SUM(amount),0) FROM payments "
+            f"WHERE party_type='customer' AND party_id=? AND {w}", [cust_id]+pr).fetchone()[0]
+        return {"sales": sales_pos, "services": services, "returns": returns, "payments": payments}
 
     @staticmethod
     def customer_report(c, cust_id, date_from, date_to):
@@ -1428,10 +1476,20 @@ class ReportsDAO(BaseDAO):
         total_paid_final = total_paid + account_paid
         total_remain = max(0, total_remain_inv + opening_balance - account_paid)
         all_payments = PaymentsDAO.get_by_party(c, "customer", cust_id)
+        # الرصيد السابق = الرصيد الافتتاحي + (مبيعات وخدمات − مردودات − دفعات) لكل ما قبل date_from
+        prev = ReportsDAO._cust_movements(c, cust_id, date_from)
+        previous_balance = opening_balance + prev["sales"] + prev["services"] - prev["returns"] - prev["payments"]
+        per = ReportsDAO._cust_movements(c, cust_id, date_from, date_to)
+        period_debit = per["sales"] + per["services"]
+        period_credit = per["returns"] + per["payments"]
+        closing_balance = previous_balance + period_debit - period_credit
         return {"customer": cust, "sales": ss, "services": sos, "transactions": transactions, "total": total_s,
                 "total_paid": total_paid_final, "total_remaining": total_remain,
                 "account_paid": account_paid, "opening_balance": opening_balance, "all_payments": all_payments,
-                "date_from": date_from, "date_to": date_to, "count": len(transactions)}
+                "date_from": date_from, "date_to": date_to, "count": len(transactions),
+                "previous_balance": previous_balance, "period_debit": period_debit,
+                "period_returns": per["returns"], "period_payments": per["payments"],
+                "period_credit": period_credit, "closing_balance": closing_balance}
 
     @staticmethod
     def cheques_report(c, direction, status, date_from, date_to):
@@ -5788,8 +5846,15 @@ function custServiceCardHTML(so){
   </div>`;
 }
 
+function custBalText(v){
+  v = Math.round((v||0)*100)/100;
+  const col = v>0 ? '#fbbf24' : v<0 ? '#60a5fa' : '#52b788';
+  const lbl = v>0 ? 'عليه' : v<0 ? 'له' : 'مسدد';
+  return `<span style="color:${col};">${Math.abs(v).toLocaleString()} ${cur()}</span> <span style="font-size:11px;color:#94a3b8;">${lbl}</span>`;
+}
 function custRepHTML(d){
-  const {customer:c,transactions:tx,total,total_paid,total_remaining,all_payments,count,date_from,date_to,account_paid=0,opening_balance=0}=d;
+  const {customer:c,transactions:tx,total,total_paid,total_remaining,all_payments,count,date_from,date_to,account_paid=0,opening_balance=0,
+         previous_balance=0,period_debit=0,period_credit=0,closing_balance=0}=d;
   const tier = customerTier(c.id);
   const overdue = customerOverdueInfo(c.id);
   return `<div id="spa">
@@ -5810,6 +5875,14 @@ function custRepHTML(d){
       <div class="stat"><div style="font-size:12px;color:#64748b;">الإجمالي (مبيعات + خدمات)</div><div style="font-size:18px;font-weight:800;color:#f1f5f9;margin-top:4px;">${total.toLocaleString()} ${cur()}</div></div>
       <div class="stat"><div style="font-size:12px;color:#64748b;">إجمالي المدفوع</div><div style="font-size:18px;font-weight:800;color:#52b788;margin-top:4px;">${(total_paid||0).toLocaleString()} ${cur()}</div>${account_paid>0?`<div style="font-size:10px;color:#94a3b8;margin-top:2px;">منها ${account_paid.toLocaleString()} ${cur()} دفعات مباشرة</div>`:''}</div>
       <div class="stat"><div style="font-size:12px;color:#64748b;">المتبقي (مستحق)</div><div style="font-size:18px;font-weight:800;color:${(total_remaining||0)>0?'#fbbf24':'#52b788'};margin-top:4px;">${(total_remaining||0).toLocaleString()} ${cur()}</div>${opening_balance?`<div style="font-size:10px;color:#94a3b8;margin-top:2px;">شامل ${opening_balance.toLocaleString()} ${cur()} رصيد افتتاحي</div>`:''}</div>
+    </div>
+  </div>
+  <div class="card" style="padding:14px;margin-bottom:12px;background:linear-gradient(135deg,#1a2233,#161923);">
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;">
+      <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">الرصيد السابق (قبل ${date_from})</div><div style="font-size:18px;font-weight:900;margin-top:4px;">${custBalText(previous_balance)}</div></div>
+      <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">+ مبيعات وخدمات الفترة</div><div style="font-size:18px;font-weight:800;color:#f1f5f9;margin-top:4px;">${(period_debit||0).toLocaleString()} ${cur()}</div></div>
+      <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">− دفعات ومردودات الفترة</div><div style="font-size:18px;font-weight:800;color:#52b788;margin-top:4px;">${(period_credit||0).toLocaleString()} ${cur()}</div></div>
+      <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">الرصيد الختامي (حتى ${date_to})</div><div style="font-size:18px;font-weight:900;margin-top:4px;">${custBalText(closing_balance)}</div></div>
     </div>
   </div>
   ${(tx||[]).map(t=>t.kind==='service'?custServiceCardHTML(t):custSaleCardHTML(t)).join('')||'<div class="card" style="padding:28px;text-align:center;color:#475569;">لا توجد عمليات في هذه الفترة</div>'}
@@ -5863,8 +5936,15 @@ function custRepHTML(d){
   </div>`;
 }
 
+function supBalText(v){
+  v = Math.round((v||0)*100)/100;
+  const col = v>0 ? '#f87171' : v<0 ? '#60a5fa' : '#52b788';
+  const lbl = v>0 ? 'علينا' : v<0 ? 'لنا' : 'مسدد';
+  return `<span style="color:${col};">${Math.abs(v).toLocaleString()} ${cur()}</span> <span style="font-size:11px;color:#94a3b8;">${lbl}</span>`;
+}
 function supRepHTML(d){
-  const {supplier:s,purchases:ps,total,total_paid,total_remaining,all_payments,count,date_from,date_to,account_paid=0,opening_balance=0}=d;
+  const {supplier:s,purchases:ps,total,total_paid,total_remaining,all_payments,count,date_from,date_to,account_paid=0,opening_balance=0,
+         previous_balance=0,period_debit=0,period_credit=0,closing_balance=0}=d;
   return `<div id="spa">
   <div class="card" style="padding:18px;margin-bottom:12px;">
     <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;">
@@ -5878,6 +5958,14 @@ function supRepHTML(d){
       <div class="stat"><div style="font-size:12px;color:#64748b;">إجمالي المشتريات</div><div style="font-size:18px;font-weight:800;color:#f1f5f9;margin-top:4px;">${total.toLocaleString()} ${cur()}</div></div>
       <div class="stat"><div style="font-size:12px;color:#64748b;">إجمالي المدفوع</div><div style="font-size:18px;font-weight:800;color:#52b788;margin-top:4px;">${(total_paid||0).toLocaleString()} ${cur()}</div>${account_paid>0?`<div style="font-size:10px;color:#94a3b8;margin-top:2px;">منها ${account_paid.toLocaleString()} ${cur()} دفعات مباشرة</div>`:''}</div>
       <div class="stat"><div style="font-size:12px;color:#64748b;">المتبقي (مستحق)</div><div style="font-size:18px;font-weight:800;color:${(total_remaining||0)>0?'#f87171':'#52b788'};margin-top:4px;">${(total_remaining||0).toLocaleString()} ${cur()}</div>${opening_balance?`<div style="font-size:10px;color:#94a3b8;margin-top:2px;">شامل ${opening_balance.toLocaleString()} ${cur()} رصيد افتتاحي</div>`:''}</div>
+    </div>
+  </div>
+  <div class="card" style="padding:14px;margin-bottom:12px;background:linear-gradient(135deg,#1a2233,#161923);">
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;">
+      <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">الرصيد السابق (قبل ${date_from})</div><div style="font-size:18px;font-weight:900;margin-top:4px;">${supBalText(previous_balance)}</div></div>
+      <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">+ مشتريات الفترة</div><div style="font-size:18px;font-weight:800;color:#f1f5f9;margin-top:4px;">${(period_debit||0).toLocaleString()} ${cur()}</div></div>
+      <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">− دفعات ومردودات الفترة</div><div style="font-size:18px;font-weight:800;color:#52b788;margin-top:4px;">${(period_credit||0).toLocaleString()} ${cur()}</div></div>
+      <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">الرصيد الختامي (حتى ${date_to})</div><div style="font-size:18px;font-weight:900;margin-top:4px;">${supBalText(closing_balance)}</div></div>
     </div>
   </div>
   ${ps.map(p=>`
@@ -6010,6 +6098,10 @@ window.exportSupplierExcel = function(d){
     {'البيان':'اسم المورد','القيمة':s.name},
     {'البيان':'الفترة','القيمة': d.date_from+' الى '+d.date_to},
     {'البيان':'عدد الفواتير','القيمة': d.count},
+    {'البيان':'الرصيد السابق (قبل '+d.date_from+')','القيمة': d.previous_balance||0},
+    {'البيان':'مشتريات الفترة','القيمة': d.period_debit||0},
+    {'البيان':'دفعات ومردودات الفترة','القيمة': d.period_credit||0},
+    {'البيان':'الرصيد الختامي (حتى '+d.date_to+')','القيمة': d.closing_balance||0},
     {'البيان':'إجمالي المشتريات','القيمة': d.total},
     {'البيان':'إجمالي المدفوع','القيمة': d.total_paid},
     {'البيان':'المتبقي (مستحق)','القيمة': d.total_remaining},
@@ -6052,6 +6144,10 @@ window.exportCustomerExcel = function(d){
     {'البيان':'رقم الهاتف','القيمة':c.phone||''},
     {'البيان':'الفترة','القيمة': d.date_from+' الى '+d.date_to},
     {'البيان':'عدد العمليات','القيمة': d.count},
+    {'البيان':'الرصيد السابق (قبل '+d.date_from+')','القيمة': d.previous_balance||0},
+    {'البيان':'مبيعات وخدمات الفترة','القيمة': d.period_debit||0},
+    {'البيان':'دفعات ومردودات الفترة','القيمة': d.period_credit||0},
+    {'البيان':'الرصيد الختامي (حتى '+d.date_to+')','القيمة': d.closing_balance||0},
     {'البيان':'الإجمالي (مبيعات + خدمات)','القيمة': d.total},
     {'البيان':'إجمالي المدفوع','القيمة': d.total_paid},
     {'البيان':'المتبقي (مستحق)','القيمة': d.total_remaining},
