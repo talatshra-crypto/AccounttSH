@@ -684,6 +684,32 @@ class ProductsDAO(BaseDAO):
     def delete(c, pid):
         c.execute("DELETE FROM products WHERE id=?", (pid,))
     @staticmethod
+    def apply_purchase_price(c, pid, new_cost):
+        """عند الشراء بسعر مختلف: يُحدَّث سعر الشراء (التكلفة) إلى السعر الجديد، ويُعدَّل سعر البيع
+        بنفس نسبة الربح السابقة (sell_new = sell_old × new_cost / old_cost). يعيد وصف التغيير أو None."""
+        prod = BaseDAO.row1(c.execute("SELECT id,name,buy_price,sell_price FROM products WHERE id=?", (pid,)))
+        if not prod: return None
+        try: new_cost = float(new_cost or 0)
+        except (TypeError, ValueError): return None
+        old_cost = float(prod["buy_price"] or 0)
+        old_sell = float(prod["sell_price"] or 0)
+        if new_cost <= 0 or abs(new_cost - old_cost) < 0.005: return None
+        if old_cost > 0 and old_sell > 0:
+            new_sell = round(old_sell * new_cost / old_cost, 2)
+        else:
+            new_sell = old_sell          # لا يوجد سعر سابق نبني عليه النسبة، يبقى سعر البيع كما هو
+        c.execute("UPDATE products SET buy_price=?, sell_price=? WHERE id=?", (new_cost, new_sell, pid))
+        return {"product_id": pid, "name": prod["name"], "old_buy": old_cost, "new_buy": new_cost,
+                "old_sell": old_sell, "new_sell": new_sell}
+
+    @staticmethod
+    def is_latest_purchase(c, pid, purchase_id):
+        """هل هذه الفاتورة هي آخر فاتورة شراء (غير مردودة) تضم المنتج؟ تعديل فاتورة قديمة لا يغيّر الأسعار."""
+        r = c.execute("SELECT MAX(pi.purchase_id) FROM purchase_items pi JOIN purchases pu ON pu.id=pi.purchase_id "
+                      "WHERE pi.product_id=? AND COALESCE(pu.status,'')<>'مردود'", (pid,)).fetchone()
+        return bool(r and r[0] == purchase_id)
+
+    @staticmethod
     def update_stock(c, pid, delta):
         if delta >= 0:
             c.execute("UPDATE products SET stock=stock+? WHERE id=?", (delta, pid))
@@ -1931,9 +1957,12 @@ def handle_api(method, path, body, req):
             total = sum(i["qty"]*i["price"] for i in items)
             supplier_id = int(body.get("supplier_id")) if body.get("supplier_id") else None
             pid = PurchasesDAO.create(c, supplier_id, body.get("date",""), body.get("status","معلق"), body.get("notes",""), total)
+            price_changes = []
             for i in items:
                 PurchasesDAO.create_item(c, pid, i["product_id"], i["qty"], i["price"])
                 ProductsDAO.update_stock(c, i["product_id"], i["qty"])
+                ch = ProductsDAO.apply_purchase_price(c, i["product_id"], i["price"])
+                if ch: price_changes.append(ch)
                 serials = [s.strip() for s in i.get("serials",[]) if str(s).strip()]
                 for s in serials:
                     try:
@@ -1943,6 +1972,7 @@ def handle_api(method, path, body, req):
             c.commit()
             p = PurchasesDAO.get_by_id(c, pid)
             p["items"] = PurchasesDAO.get_items(c, pid)
+            p["price_changes"] = price_changes
             c.close(); return 201,p
         if method=="PUT" and len(parts)==3:
             pid = int(parts[2])
@@ -1962,9 +1992,13 @@ def handle_api(method, path, body, req):
             ProductUnitsDAO.unpin_purchase(c, pid)
             supplier_id = int(body.get("supplier_id")) if body.get("supplier_id") else None
             PurchasesDAO.update(c, pid, supplier_id, body.get("date",""), body.get("status","معلق"), body.get("notes",""), total)
+            price_changes = []
             for i in items:
                 PurchasesDAO.create_item(c, pid, i["product_id"], i["qty"], i["price"])
                 ProductsDAO.update_stock(c, i["product_id"], i["qty"])
+                if ProductsDAO.is_latest_purchase(c, i["product_id"], pid):
+                    ch = ProductsDAO.apply_purchase_price(c, i["product_id"], i["price"])
+                    if ch: price_changes.append(ch)
                 serials = [s.strip() for s in i.get("serials",[]) if str(s).strip()]
                 for s in serials:
                     try:
@@ -1974,6 +2008,7 @@ def handle_api(method, path, body, req):
             c.commit()
             p = PurchasesDAO.get_by_id(c, pid)
             p["items"] = PurchasesDAO.get_items(c, pid)
+            p["price_changes"] = price_changes
             c.close(); return 200, p
         if method=="DELETE" and len(parts)==3:
             pid = int(parts[2])
@@ -2805,6 +2840,13 @@ window.onerror = function(msg, src, line, col, err){
   return false;
 };
 
+function showPriceChanges(ch){
+  if(!ch || !ch.length) return;
+  const f = v => (Math.round((v||0)*100)/100).toLocaleString();
+  const lines = ch.map(x => '• '+x.name+'\n   سعر الشراء: '+f(x.old_buy)+' ← '+f(x.new_buy)
+      + (x.new_sell!==x.old_sell ? '\n   سعر البيع: '+f(x.old_sell)+' ← '+f(x.new_sell) : '\n   سعر البيع بقي '+f(x.old_sell))).join('\n');
+  alert('تم تحديث أسعار المنتجات حسب فاتورة الشراء (بنفس نسبة الربح السابقة):\n\n'+lines+'\n\nيمكنك تعديل سعر البيع يدويًا من صفحة المنتجات.');
+}
 async function api(method,path,body){
   const h={'Content-Type':'application/json'};
   if(TOKEN) h['Authorization']='Bearer '+TOKEN;
@@ -8573,12 +8615,14 @@ function bindModal(){
           supplier_id: parseInt(sup), date, status, notes:'',
           items: cart.map(i=>({product_id:i.product_id,qty:i.qty,price:i.price,serials:i.serials||[]}))
         };
+        let saved;
         if(isEdit){
-          await api('PUT','/api/purchases/'+isEdit, body);
+          saved = await api('PUT','/api/purchases/'+isEdit, body);
         } else {
-          await api('POST','/api/purchases', body);
+          saved = await api('POST','/api/purchases', body);
         }
         cart=[]; await loadAll(); closeM();
+        showPriceChanges(saved && saved.price_changes);
       }catch(e){alert('خطأ: '+e.message);}
     };
   }
@@ -8603,11 +8647,12 @@ function bindModal(){
       }
       document.getElementById('edit-pus').style.border='';
       try{
-        await api('PUT','/api/purchases/'+eid,{
+        const saved = await api('PUT','/api/purchases/'+eid,{
           supplier_id: parseInt(sup), date, status, notes,
           items: cart.map(i=>({product_id:i.product_id,qty:i.qty,price:i.price,serials:i.serials||[]}))
         });
         cart=[]; await loadAll(); closeM();
+        showPriceChanges(saved && saved.price_changes);
       }catch(e){alert('خطأ: '+e.message);}
     };
 
