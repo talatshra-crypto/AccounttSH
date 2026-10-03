@@ -684,6 +684,33 @@ class ProductsDAO(BaseDAO):
     def delete(c, pid):
         c.execute("DELETE FROM products WHERE id=?", (pid,))
     @staticmethod
+    def sale_cost(c, pid, serials=None):
+        """تكلفة الوحدة وقت البيع، مأخوذة من فواتير الشراء وليس من سعر الشراء المخزَّن في بطاقة المنتج:
+        1) منتج بسيريال: متوسط سعر شراء الوحدات المباعة نفسها (من فاتورة شراء كل وحدة).
+        2) غير ذلك: سعر آخر فاتورة شراء (الأحدث تاريخًا ثم رقمًا) غير مردودة.
+        3) لا توجد فواتير شراء إطلاقًا (مخزون افتتاحي): سعر الشراء في بطاقة المنتج كاحتياط أخير."""
+        pid = int(pid)
+        latest = c.execute(
+            "SELECT pi.price FROM purchase_items pi JOIN purchases pu ON pu.id=pi.purchase_id "
+            "WHERE pi.product_id=? AND pu.total>0 AND COALESCE(pu.status,'')<>'مردود' AND pi.price>0 "
+            "ORDER BY pu.date DESC, pu.id DESC, pi.id DESC LIMIT 1", (pid,)).fetchone()
+        latest_price = float(latest[0]) if latest else None
+        if serials:
+            costs = []
+            for sn in serials:
+                r = c.execute(
+                    "SELECT pi.price FROM product_units u JOIN purchase_items pi "
+                    "ON pi.purchase_id=u.purchase_id AND pi.product_id=u.product_id "
+                    "WHERE u.serial=? AND u.product_id=? AND pi.price>0 ORDER BY pi.id DESC LIMIT 1",
+                    (sn, pid)).fetchone()
+                costs.append(float(r[0]) if r else latest_price)
+            costs = [x for x in costs if x is not None]
+            if costs: return round(sum(costs) / len(costs), 4)
+        if latest_price is not None: return latest_price
+        prod = BaseDAO.row1(c.execute("SELECT buy_price FROM products WHERE id=?", (pid,)))
+        return float((prod["buy_price"] if prod else 0) or 0)
+
+    @staticmethod
     def apply_purchase_price(c, pid, new_cost):
         """عند الشراء بسعر مختلف: يُحدَّث سعر الشراء (التكلفة) إلى السعر الجديد، ويُعدَّل سعر البيع
         بنفس نسبة الربح السابقة (sell_new = sell_old × new_cost / old_cost). يعيد وصف التغيير أو None."""
@@ -2047,6 +2074,86 @@ def handle_api(method, path, body, req):
                 "WHERE pri.return_id=?", (rid,)))
             c.close(); return 201, r
 
+    # ── تعديل مباشر من التقرير التفصيلي (كمية / سعر شراء / سعر بيع) ──
+    if ep == "report_edit" and method == "PUT" and len(parts) == 4:
+        perms = effective_permissions(u)
+        if "detailed" not in (perms.get("reports") or []):
+            c.close(); return 403, {"detail": "غير مصرح — لا تملك صلاحية التقرير التفصيلي"}
+        kind, rid = parts[2], int(parts[3])
+
+        def _num(key, cur_val, integer=False):
+            if body.get(key) is None: return cur_val
+            try: v = float(body.get(key))
+            except (TypeError, ValueError): raise ValueError("قيمة غير صحيحة")
+            if v < 0: raise ValueError("لا يمكن إدخال قيمة سالبة")
+            if integer:
+                if v != int(v) or int(v) < 1: raise ValueError("الكمية يجب أن تكون عددًا صحيحًا لا يقل عن 1")
+                return int(v)
+            return v
+
+        if kind == "sale_item":
+            if not user_can_page(u, "pos"):
+                c.close(); return 403, {"detail": "غير مصرح — لا تملك صلاحية تعديل المبيعات"}
+            it = BaseDAO.row1(c.execute("SELECT * FROM sale_items WHERE id=?", (rid,)))
+            if not it: c.close(); return 404, {"detail": "البند غير موجود"}
+            sid = it["sale_id"]
+            sale = BaseDAO.row1(c.execute("SELECT * FROM sales WHERE id=?", (sid,)))
+            if not sale or (sale.get("total") or 0) < 0 or sale.get("status") == "مردود":
+                c.close(); return 400, {"detail": "لا يمكن تعديل فاتورة مردود من هنا"}
+            prod = ProductsDAO.get_by_id(c, it["product_id"]) or {}
+            try:
+                new_qty   = _num("qty", it["qty"], integer=True)
+                new_price = _num("price", it["price"])
+                new_cost  = _num("cost_price", it["cost_price"])
+            except ValueError as e:
+                c.close(); return 400, {"detail": str(e)}
+            delta = new_qty - it["qty"]
+            if delta != 0:
+                if prod.get("track_serial"):
+                    c.close(); return 400, {"detail": "منتج بسيريال: الكمية مرتبطة بالسيريالات، عدّلها من تعديل الفاتورة"}
+                # لا تقل الكمية عن المُرجَع من هذه الفاتورة لنفس المنتج
+                returned = c.execute(
+                    "SELECT COALESCE(SUM(ri.qty),0) FROM sales r JOIN sale_items ri ON ri.sale_id=r.id "
+                    "WHERE r.status='مردود' AND r.notes LIKE ? AND ri.product_id=?",
+                    (f"مردود من فاتورة #{sid} -%", it["product_id"])).fetchone()[0]
+                others = c.execute("SELECT COALESCE(SUM(qty),0) FROM sale_items WHERE sale_id=? AND product_id=? AND id<>?",
+                                   (sid, it["product_id"], rid)).fetchone()[0]
+                if others + new_qty < returned:
+                    c.close(); return 400, {"detail": f"الكمية أقل من المُرجَع من هذه الفاتورة ({returned})"}
+                if delta > 0 and (prod.get("stock") or 0) < delta:
+                    c.close(); return 400, {"detail": f"المخزون غير كافٍ (المتوفر {prod.get('stock') or 0})"}
+                ProductsDAO.update_stock(c, it["product_id"], -delta)   # بيع أكثر = خصم، بيع أقل = إعادة للمخزون
+            c.execute("UPDATE sale_items SET qty=?, price=?, cost_price=? WHERE id=?", (new_qty, new_price, new_cost, rid))
+            # إعادة احتساب إجمالي الفاتورة (مع خصم الفاتورة الأصلي)
+            raw = c.execute("SELECT COALESCE(SUM(qty*price - COALESCE(discount,0)),0) FROM sale_items WHERE sale_id=?", (sid,)).fetchone()[0]
+            new_total = max(0.0, raw - float(sale.get("discount") or 0))
+            c.execute("UPDATE sales SET total=? WHERE id=?", (new_total, sid))
+            # مزامنة حالة الدفع فقط إن كانت للفاتورة دفعات مسجّلة (المبيعات النقدية بلا دفعات تبقى كما هي)
+            if PaymentsDAO.total_by_ref(c, "sale", sid) > 0:
+                PaymentsDAO.update_invoice_status(c, "sale", sid)
+            c.commit()
+            res = {"sale": SalesDAO.get_by_id(c, sid), "product_id": it["product_id"],
+                   "product_stock": (ProductsDAO.get_by_id(c, it["product_id"]) or {}).get("stock")}
+            c.close(); return 200, res
+
+        if kind == "service":
+            if not user_can_page(u, "services"):
+                c.close(); return 403, {"detail": "غير مصرح — لا تملك صلاحية تعديل الخدمات"}
+            so = BaseDAO.row1(c.execute("SELECT * FROM service_orders WHERE id=?", (rid,)))
+            if not so: c.close(); return 404, {"detail": "طلب الخدمة غير موجود"}
+            if body.get("qty") is not None or body.get("cost_price") is not None:
+                c.close(); return 400, {"detail": "تكلفة القطع تُحسب من قطع الغيار، عدّلها من صفحة الخدمات"}
+            try: fee = _num("price", so["service_fee"])
+            except ValueError as e:
+                c.close(); return 400, {"detail": str(e)}
+            c.execute("UPDATE service_orders SET service_fee=? WHERE id=?", (fee, rid))
+            if PaymentsDAO.total_by_ref(c, "service", rid) > 0:
+                PaymentsDAO.update_invoice_status(c, "service", rid)
+            c.commit()
+            so = BaseDAO.row1(c.execute("SELECT service_fee, payment_status FROM service_orders WHERE id=?", (rid,)))
+            c.close(); return 200, {"service": so}
+        c.close(); return 404, {"detail": "not found"}
+
     # ── SALES ──
     if ep == "sales":
         if method=="GET" and len(parts)==2:
@@ -2074,11 +2181,10 @@ def handle_api(method, path, body, req):
             sid = SalesDAO.create(c, body.get("customer_id"), body.get("date",""), body.get("status","مدفوع"),
                                   body.get("pay_method","نقدي"), body.get("notes",""), total, invoice_discount)
             for i in items:
-                prod = ProductsDAO.get_by_id(c, i["product_id"])
-                cost_snapshot = (prod["buy_price"] if prod else 0) or 0
+                serials = [s.strip() for s in i.get("serials",[]) if str(s).strip()]
+                cost_snapshot = ProductsDAO.sale_cost(c, i["product_id"], serials)
                 SalesDAO.create_item(c, sid, i["product_id"], i["qty"], i["price"], float(i.get("discount",0) or 0), cost_snapshot)
                 ProductsDAO.update_stock(c, i["product_id"], -i["qty"])
-                serials = [s.strip() for s in i.get("serials",[]) if str(s).strip()]
                 for s in serials:
                     ProductUnitsDAO.mark_sold_by_serial(c, s, i["product_id"], sid)
             c.commit()
@@ -2110,12 +2216,17 @@ def handle_api(method, path, body, req):
             SalesDAO.delete_items(c, sid)
             SalesDAO.update(c, sid, body.get("customer_id"), body.get("date",""), body.get("status","مدفوع"),
                             body.get("pay_method","نقدي"), body.get("notes",""), total, invoice_discount)
+            old_costs = {}
+            for oi in old_items:
+                if oi.get("cost_price") is not None: old_costs.setdefault(oi["product_id"], oi["cost_price"])
             for i in items:
-                prod = ProductsDAO.get_by_id(c, i["product_id"])
-                cost_snapshot = (prod["buy_price"] if prod else 0) or 0
+                serials = [s2.strip() for s2 in i.get("serials",[]) if str(s2).strip()]
+                if not serials and i["product_id"] in old_costs:
+                    cost_snapshot = old_costs[i["product_id"]]      # تعديل فاتورة: تبقى تكلفتها التاريخية
+                else:
+                    cost_snapshot = ProductsDAO.sale_cost(c, i["product_id"], serials)
                 SalesDAO.create_item(c, sid, i["product_id"], i["qty"], i["price"], float(i.get("discount",0) or 0), cost_snapshot)
                 ProductsDAO.update_stock(c, i["product_id"], -i["qty"])
-                serials = [s2.strip() for s2 in i.get("serials",[]) if str(s2).strip()]
                 for s2 in serials:
                     ProductUnitsDAO.mark_sold_by_serial(c, s2, i["product_id"], sid)
             c.commit()
@@ -2475,7 +2586,8 @@ def handle_api(method, path, body, req):
                                           f"محوّل من عرض سعر #{qid}", sale_total, 0)
                 for i in product_items:
                     prod = ProductsDAO.get_by_id(c, i["product_id"])
-                    cost_snapshot = (prod["buy_price"] if prod else 0) or 0
+                    _given = [str(x).strip() for x in serials_map.get(str(i["product_id"]), []) if str(x).strip()] if (prod and prod.get("track_serial")) else []
+                    cost_snapshot = ProductsDAO.sale_cost(c, i["product_id"], _given)
                     SalesDAO.create_item(c, sale_id, i["product_id"], i["qty"], i["price"], 0, cost_snapshot)
                     ProductsDAO.update_stock(c, i["product_id"], -i["qty"])
                     if prod and prod.get("track_serial"):
@@ -5334,6 +5446,26 @@ document.addEventListener('click', function(e){
   }
 });
 
+window._drepEdit = false;
+window.drepToggleEdit = function(){ window._drepEdit = !window._drepEdit; renderDetailedReport(); };
+window.drepSave = async function(kind, id, field, val){
+  try{
+    const num = parseFloat(val);
+    if(isNaN(num)) throw new Error('قيمة غير صحيحة');
+    const body = {}; body[field] = num;
+    const res = await api('PUT', '/api/report_edit/'+(kind==='service'?'service':'sale_item')+'/'+id, body);
+    if(kind==='service'){
+      const o = serviceOrders.find(x=>x.id===id);
+      if(o && res.service){ o.service_fee = res.service.service_fee; o.payment_status = res.service.payment_status; }
+    } else {
+      const i = sales.findIndex(x=>x.id===res.sale.id);
+      if(i>=0) sales[i] = res.sale;
+      const pr = products.find(x=>x.id===res.product_id);
+      if(pr && res.product_stock!=null) pr.stock = res.product_stock;
+    }
+  }catch(e){ alert('خطأ: '+e.message); }
+  renderDetailedReport();
+};
 window.renderDetailedReport = function(){
   const el = document.getElementById('detailed-rep-body');
   if(!el) return;
@@ -5348,15 +5480,17 @@ window.renderDetailedReport = function(){
   if(kind !== 'service'){
     sales.filter(s=>s.date>=from && s.date<=to && (!custId || parseInt(s.customer_id)===custId)).forEach(s=>{
       const custName = customers.find(c=>c.id===parseInt(s.customer_id))?.name || 'زبون عام';
-      groupInvoiceItems(s.items||[]).forEach(item=>{
+      const isReturnInv = (s.status==='مردود') || ((s.total||0)<0);
+      (s.items||[]).forEach(item=>{
         const prod = products.find(p=>p.id===item.product_id);
         const buyPrice = (item.cost_price!=null) ? item.cost_price : (prod ? (prod.buy_price||0) : 0);
         const sellPrice = item.price||0;
         const qty = item.qty||0;
         rows.push({
-          date: s.date, kind:'sale', ref: '#'+s.id, party: custName,
+          date: s.date, kind:'sale', id:item.id, ref: '#'+s.id, party: custName,
           desc: item.product_name || prod?.name || ('منتج #'+item.product_id),
-          qty, buyPrice, sellPrice, margin: (sellPrice-buyPrice)*qty, total: sellPrice*qty
+          qty, buyPrice, sellPrice, margin: (sellPrice-buyPrice)*qty, total: sellPrice*qty,
+          editable: !isReturnInv, serialLocked: !!item.track_serial
         });
       });
     });
@@ -5367,9 +5501,9 @@ window.renderDetailedReport = function(){
       const buyPrice = o.parts_cost||0;
       const sellPrice = o.service_fee||0;
       rows.push({
-        date: o.received_date, kind:'service', ref:'#'+o.id, party: o.customer_name||'—',
+        date: o.received_date, kind:'service', id:o.id, ref:'#'+o.id, party: o.customer_name||'—',
         desc: (o.service_type||'خدمة') + (o.device_desc?(' — '+o.device_desc):''),
-        qty:1, buyPrice, sellPrice, margin: sellPrice-buyPrice, total: sellPrice
+        qty:1, buyPrice, sellPrice, margin: sellPrice-buyPrice, total: sellPrice, editable:true
       });
     });
   }
@@ -5381,7 +5515,15 @@ window.renderDetailedReport = function(){
   const totalMargin = rows.reduce((s,r)=>s+r.margin,0);
   const custObj     = custId ? customers.find(c=>c.id===custId) : null;
 
-  el.innerHTML = printPdfToolbar('detailed-rep-print','التقرير التفصيلي (شراء/بيع/خدمة)') + `<div id="detailed-rep-print">
+  const EDIT = !!window._drepEdit;
+  const inp = (r, field, val, step, w) => `<input class="inp" type="number" min="${field==='qty'?1:0}" step="${step}" value="${val}" `
+    + `style="width:${w}px;padding:3px 6px;font-size:12px;" onchange="drepSave('${r.kind}',${r.id},'${field}',this.value)">`;
+  el.innerHTML = printPdfToolbar('detailed-rep-print','التقرير التفصيلي (شراء/بيع/خدمة)') + `
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">
+    <button class="btn ${EDIT?'p':'s'}" onclick="drepToggleEdit()">${EDIT?'✅ إنهاء التعديل':'✏️ تعديل الأسعار والكميات'}</button>
+    ${EDIT?'<span style="font-size:12px;color:#fbbf24;">وضع التعديل: غيّر القيمة واضغط Enter أو انتقل لحقل آخر ليُحفظ. التعديل يحدّث الفاتورة والمخزون والأرصدة.</span>':''}
+  </div>
+  <div id="detailed-rep-print">
   ${custObj?`<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
     <span class="badge b" style="font-size:12px;padding:6px 12px;">👤 مفلتَر حسب: ${esc(custObj.name)}</span>
     <button class="btn s" style="padding:3px 10px;font-size:11px;" onclick="drepPickCustomer('','');renderDetailedReport();">✕ إزالة الفلتر</button>
@@ -5404,9 +5546,9 @@ window.renderDetailedReport = function(){
       <td style="color:#64748b;">${r.ref}</td>
       <td style="color:#60a5fa;font-weight:600;">${esc(r.party)}</td>
       <td style="color:#f1f5f9;font-weight:600;">${esc(r.desc)}</td>
-      <td style="color:#94a3b8;">${r.qty}</td>
-      <td style="color:#f87171;">${r.buyPrice.toLocaleString()} ${cur()}</td>
-      <td style="color:#52b788;">${r.sellPrice.toLocaleString()} ${cur()}</td>
+      <td style="color:#94a3b8;">${EDIT && r.editable && r.kind==='sale' && !r.serialLocked ? inp(r,'qty',r.qty,1,70) : (r.qty + (EDIT && r.serialLocked ? ' 🔒' : ''))}</td>
+      <td style="color:#f87171;">${EDIT && r.editable && r.kind==='sale' ? inp(r,'cost_price',r.buyPrice,'any',95) : r.buyPrice.toLocaleString()+' '+cur()}</td>
+      <td style="color:#52b788;">${EDIT && r.editable ? inp(r,'price',r.sellPrice,'any',95) : r.sellPrice.toLocaleString()+' '+cur()}</td>
       <td style="font-weight:700;color:${r.margin>=0?'#fbbf24':'#f87171'};">${r.margin.toLocaleString()} ${cur()}</td>
       <td style="font-weight:700;">${r.total.toLocaleString()} ${cur()}</td>
       </tr>`).join('') || '<tr><td colspan="10" style="text-align:center;color:#475569;padding:20px;">لا توجد بيانات ضمن هذه الفلترة</td></tr>'}
