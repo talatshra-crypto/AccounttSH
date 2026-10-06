@@ -199,6 +199,21 @@ def init_db():
         discount REAL DEFAULT 0,
         cost_price REAL DEFAULT NULL
     );
+    CREATE TABLE IF NOT EXISTS warranty_claims(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sale_id INTEGER,
+        customer_id INTEGER,
+        product_id INTEGER REFERENCES products(id),
+        qty INTEGER DEFAULT 1,
+        serials TEXT DEFAULT '',
+        replacement_serials TEXT DEFAULT '',
+        resolution TEXT DEFAULT 'replace',
+        refund_sale_id INTEGER,
+        reason TEXT DEFAULT '',
+        status TEXT DEFAULT 'معيب عندنا',
+        date TEXT DEFAULT '',
+        created_at TEXT DEFAULT(datetime('now'))
+    );
     CREATE TABLE IF NOT EXISTS product_units(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
@@ -784,6 +799,10 @@ class ProductUnitsDAO(BaseDAO):
     @staticmethod
     def unpin_purchase(c, pid):
         c.execute("UPDATE product_units SET purchase_id=NULL WHERE purchase_id=?", (pid,))
+    @staticmethod
+    def mark_defective(c, serial, product_id):
+        c.execute("UPDATE product_units SET status='defective', sale_id=NULL WHERE serial=? AND product_id=?",
+                  (serial, product_id))
     @staticmethod
     def delete_by_serial(c, serial):
         c.execute("DELETE FROM product_units WHERE serial=?", (serial,))
@@ -2785,6 +2804,108 @@ def handle_api(method, path, body, req):
         c.close(); return 201, ret
 
     # ── SALE RETURN (مردود مبيعات من الزبون) ──
+    # ── كفالة المنتجات: قائمة المطالبات ──
+    if ep == "warranty_claims" and method == "GET" and len(parts) == 2:
+        if not (user_can_page(u, "pos") or user_can_page(u, "warehouse")):
+            c.close(); return 403, {"detail": "غير مصرح"}
+        rows = BaseDAO.rows(c.execute(
+            "SELECT w.*, p.name AS product_name, cu.name AS customer_name FROM warranty_claims w "
+            "LEFT JOIN products p ON p.id=w.product_id LEFT JOIN customers cu ON cu.id=w.customer_id "
+            "ORDER BY w.id DESC"))
+        c.close(); return 200, rows
+
+    # ── كفالة المنتجات: تغيير حالة المعيب (مرسل للمورد / عاد للمخزون / مشطوب) ──
+    if ep == "warranty_claims" and method == "PUT" and len(parts) == 3:
+        if not user_can_page(u, "pos"):
+            c.close(); return 403, {"detail": "غير مصرح"}
+        cid = int(parts[2]); new_status = body.get("status", "")
+        if new_status not in ("معيب عندنا", "مرسل للمورد", "عاد للمخزون", "مشطوب"):
+            c.close(); return 400, {"detail": "حالة غير صحيحة"}
+        cl = BaseDAO.row1(c.execute("SELECT * FROM warranty_claims WHERE id=?", (cid,)))
+        if not cl: c.close(); return 404, {"detail": "غير موجود"}
+        if cl["status"] in ("عاد للمخزون", "مشطوب"):
+            c.close(); return 400, {"detail": "المطالبة مغلقة ولا يمكن تغيير حالتها"}
+        if new_status == "عاد للمخزون":
+            sers = [x for x in (cl["serials"] or "").split(",") if x]
+            if sers:
+                for sn in sers:
+                    c.execute("UPDATE product_units SET status='in_stock', sale_id=NULL WHERE serial=? AND product_id=?",
+                              (sn, cl["product_id"]))
+            ProductsDAO.update_stock(c, cl["product_id"], cl["qty"])
+        c.execute("UPDATE warranty_claims SET status=? WHERE id=?", (new_status, cid))
+        c.commit(); c.close(); return 200, {"id": cid, "status": new_status}
+
+    # ── مردود كفالة: القطعة معيبة ولا تعود للمخزون؛ إما استبدال بقطعة سليمة أو استرداد المبلغ ──
+    if ep == "warranty_return" and method == "POST":
+        if not user_can_page(u, "pos"):
+            c.close(); return 403, {"detail": "غير مصرح — لا تملك صلاحية المبيعات"}
+        sid = body.get("sale_id"); items = body.get("items", []) or []
+        resolution = body.get("resolution", "replace")
+        reason = (body.get("notes") or "").strip(); date = body.get("date", "")
+        if resolution not in ("replace", "refund"):
+            c.close(); return 400, {"detail": "نوع المعالجة غير صحيح"}
+        if not sid or not items:
+            c.close(); return 400, {"detail": "يجب تحديد الفاتورة وصنف واحد على الأقل"}
+        orig = SalesDAO.get_by_id(c, sid)
+        if not orig: c.close(); return 404, {"detail": "الفاتورة الأصلية غير موجودة"}
+        if orig.get("status") == "مردود" or (orig.get("total") or 0) < 0:
+            c.close(); return 400, {"detail": "لا يمكن معالجة كفالة على فاتورة مردود"}
+        sold = {}
+        for oi in orig.get("items", []): sold[oi["product_id"]] = sold.get(oi["product_id"], 0) + oi["qty"]
+        for i in items:
+            pid, qty = i.get("product_id"), int(i.get("qty") or 0)
+            if qty < 1: c.close(); return 400, {"detail": "الكمية يجب أن تكون 1 على الأقل"}
+            returned = c.execute(
+                "SELECT COALESCE(SUM(ri.qty),0) FROM sales r JOIN sale_items ri ON ri.sale_id=r.id "
+                "WHERE r.status='مردود' AND r.notes LIKE ? AND ri.product_id=?",
+                (f"مردود من فاتورة #{sid} -%", pid)).fetchone()[0]
+            if qty > sold.get(pid, 0) - returned:
+                c.close(); return 400, {"detail": f"الكمية أكبر من المتبقي بالفاتورة للمنتج #{pid}"}
+            prod = ProductsDAO.get_by_id(c, pid) or {}
+            if prod.get("track_serial"):
+                given = [str(x).strip() for x in i.get("serials", []) if str(x).strip()]
+                if len(given) != qty: c.close(); return 400, {"detail": f"يجب تحديد {qty} سيريال معيب للمنتج {prod.get('name','')}"}
+                for sn in given:
+                    u2 = ProductUnitsDAO.get_by_serial(c, sn)
+                    if not u2 or str(u2.get("product_id")) != str(pid) or u2.get("status") != "sold" or str(u2.get("sale_id")) != str(sid):
+                        c.close(); return 400, {"detail": f"السيريال {sn} غير مرتبط بهذه الفاتورة"}
+                if resolution == "replace":
+                    rep = [str(x).strip() for x in i.get("replacement_serials", []) if str(x).strip()]
+                    if len(rep) != qty or len(set(rep)) != qty:
+                        c.close(); return 400, {"detail": f"يجب تحديد {qty} سيريال بديل للمنتج {prod.get('name','')}"}
+                    for sn in rep:
+                        u2 = ProductUnitsDAO.get_by_serial(c, sn)
+                        if not u2 or str(u2.get("product_id")) != str(pid) or u2.get("status") != "in_stock":
+                            c.close(); return 400, {"detail": f"السيريال البديل {sn} غير متاح"}
+            elif resolution == "replace" and (prod.get("stock") or 0) < qty:
+                c.close(); return 400, {"detail": f"المخزون غير كافٍ لاستبدال {prod.get('name','')} (المتوفر {prod.get('stock') or 0})"}
+
+        refund_id = None
+        if resolution == "refund":
+            total = sum(int(i["qty"]) * float(next((oi["price"] for oi in orig["items"] if oi["product_id"] == i["product_id"]), 0)) for i in items)
+            refund_id = SalesDAO.create(c, orig.get("customer_id"), date, "مردود", "إرجاع",
+                                        f"مردود من فاتورة #{sid} - كفالة: {reason}", -total, 0)
+        claim_ids = []
+        for i in items:
+            pid, qty = i["product_id"], int(i["qty"])
+            prod = ProductsDAO.get_by_id(c, pid) or {}
+            given = [str(x).strip() for x in i.get("serials", []) if str(x).strip()] if prod.get("track_serial") else []
+            rep = [str(x).strip() for x in i.get("replacement_serials", []) if str(x).strip()] if (resolution == "replace" and prod.get("track_serial")) else []
+            for sn in given: ProductUnitsDAO.mark_defective(c, sn, pid)
+            if resolution == "replace":
+                for sn in rep: ProductUnitsDAO.mark_sold_by_serial(c, sn, pid, sid)   # البديلة تُربط بنفس الفاتورة
+                if not prod.get("track_serial"): ProductsDAO.update_stock(c, pid, -qty)  # خرجت قطعة سليمة للزبون
+            else:
+                price = next((oi["price"] for oi in orig["items"] if oi["product_id"] == pid), 0)
+                SalesDAO.create_item(c, refund_id, pid, qty, price, 0, None)            # بلا إعادة للمخزون: القطعة معيبة
+            cur = c.execute(
+                "INSERT INTO warranty_claims(sale_id,customer_id,product_id,qty,serials,replacement_serials,resolution,refund_sale_id,reason,status,date) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (sid, orig.get("customer_id"), pid, qty, ",".join(given), ",".join(rep), resolution, refund_id, reason, "معيب عندنا", date))
+            claim_ids.append(cur.lastrowid)
+        c.commit()
+        c.close(); return 201, {"claim_ids": claim_ids, "refund_sale_id": refund_id, "resolution": resolution}
+
     if ep == "sale_return" and method == "POST":
         sid   = body.get("sale_id")
         items = body.get("items", [])
@@ -3538,7 +3659,10 @@ function warehouseHTML(){
   const tv=products.reduce((s,p)=>s+p.stock*p.buy_price,0);
   return `<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
     <div><div class="ti">المخازن</div><div class="sub">تفاصيل المخزون الحالي</div></div>
-    <button class="btn p" onclick="openSerialSearch()">🔍 بحث عن سيريال</button>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="btn s" onclick="openWarrantyClaims()">🛡️ مطالبات الكفالة</button>
+      <button class="btn p" onclick="openSerialSearch()">🔍 بحث عن سيريال</button>
+    </div>
   </div>
   <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:20px;">
     <div class="stat"><div style="font-size:13px;color:#64748b;">اجمالي المنتجات</div><div style="font-size:24px;font-weight:800;color:#52b788;margin-top:7px;">${products.length}</div></div>
@@ -6498,6 +6622,8 @@ function modalHTML(){
   if(MS.type==='editpur')  return editPurModal(MS.data||{});
   if(MS.type==='retpur')   return returnPurModal(MS.data||{});
   if(MS.type==='returnsale') return returnSaleModal(MS.data||{});
+  if(MS.type==='warrantysale') return warrantySaleModal(MS.data||{});
+  if(MS.type==='warrantyclaims') return warrantyClaimsModal(MS.data||{});
   if(MS?.type==='payform') return payModal(MS.data||{});
   if(MS?.type==='payhist') return payHistModal(MS.data||{});
   if(MS.type==='userform') return userModal(MS.data||{});
@@ -7287,7 +7413,7 @@ function serialSearchResultsHTML(d){
       <thead><tr><th>السيريال</th><th>المنتج</th><th>الحالة</th><th>المصدر</th><th>إجراءات</th></tr></thead>
       <tbody>
       ${d.results.map(r=>{
-        const statusBadge = r.status==='sold' ? '<span class="badge r">مباع</span>' : '<span class="badge g">متوفر</span>';
+        const statusBadge = r.status==='sold' ? '<span class="badge r">مباع</span>' : r.status==='defective' ? '<span class="badge y">معيب (كفالة)</span>' : '<span class="badge g">متوفر</span>';
         let sourceHtml = '<span style="color:#475569;">—</span>';
         if(r.status==='sold' && r.sale_info){
           sourceHtml = `<div style="font-size:12px;">بيع فاتورة #${r.sale_info.sale_id}<div style="color:#94a3b8;">${esc(r.sale_info.customer_name)} — ${r.sale_info.date}</div></div>`;
@@ -7746,6 +7872,125 @@ function returnPurModal(p){
     <button class="btn p" style="background:linear-gradient(135deg,#b45309,#92400e);" id="ms">↩️ تأكيد المردود</button>
     <button class="btn s" id="mc2">إلغاء</button>
   </div>
+  </div></div>`;
+}
+
+// ── مردود كفالة: قطعة معيبة من فاتورة بيع → استبدال بسليمة أو استرداد المبلغ (المعيبة لا تعود للمخزون) ──
+window.warrantySale = function(id){
+  const s = sales.find(x=>x.id===id);
+  if(!s){ alert('الفاتورة غير موجودة'); return; }
+  if(!(s.items||[]).length){ alert('لا توجد أصناف في هذه الفاتورة'); return; }
+  if(s.status==='مردود'){ alert('هذه فاتورة مردود ولا تُعالَج عليها كفالة'); return; }
+  MS = {type:'warrantysale', data:s};
+  render();
+};
+
+function warrantySaleModal(s){
+  const items = groupInvoiceItems(s.items||[]);
+  const custName = s.customer_id ? (customers.find(c=>c.id===parseInt(s.customer_id))?.name||'—') : 'زبون عام';
+  return `<div class="overlay" id="mover"><div class="modal" style="max-width:680px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+    <div style="font-size:16px;font-weight:700;color:#60a5fa;">🛡️ مردود كفالة — فاتورة #${s.id}</div>
+    <button class="btn s" style="padding:4px 9px;" id="mc">✕</button>
+  </div>
+  <div id="merr"></div>
+  <div style="background:#1a1d27;border:1px solid #1e3a5f;border-radius:8px;padding:12px;margin-bottom:14px;">
+    <div style="font-size:13px;color:#94a3b8;">الزبون: ${esc(custName)} | التاريخ: ${s.date} | الإجمالي: ${(s.total||0).toLocaleString()} ${cur()}</div>
+    <div style="font-size:12px;color:#64748b;margin-top:4px;">القطعة المعيبة لا تعود للمخزون، وتُسجَّل كمطالبة كفالة يمكن إرسالها للمورد لاحقًا.</div>
+  </div>
+  <div class="g2" style="margin-bottom:14px;">
+    <div><label class="lbl">نوع المعالجة</label>
+      <select class="inp" id="war-res" onchange="document.querySelectorAll('.war-rep').forEach(e=>e.style.display=this.value==='replace'?'block':'none')">
+        <option value="replace">🔁 استبدال بقطعة سليمة (بدون مبلغ)</option>
+        <option value="refund">💵 استرداد المبلغ للزبون</option>
+      </select>
+    </div>
+    <div><label class="lbl">تاريخ المعالجة</label>
+      <input class="inp" type="date" id="war-date" value="${new Date().toISOString().slice(0,10)}"/>
+    </div>
+  </div>
+  <div style="margin-bottom:14px;"><label class="lbl">وصف العطل / ملاحظات</label>
+    <input class="inp" id="war-notes" placeholder="مثال: لا يعمل / عطل مصنعي..."/>
+  </div>
+  <div style="font-size:13px;font-weight:700;color:#f1f5f9;margin-bottom:10px;">اختر الأصناف المعيبة:</div>
+  <div class="card" style="margin-bottom:14px;padding:12px;">
+    ${items.map(item=>{
+      const prod = products.find(p=>p.id===item.product_id);
+      const hasSerials = item.serials && item.serials.length;
+      return `<div style="padding:10px 0;border-bottom:1px solid #1e2537;">
+        <div style="font-weight:700;color:#f1f5f9;margin-bottom:6px;">${esc(item.product_name||prod?.name||('منتج #'+item.product_id))}
+          <span style="color:#52b788;font-weight:400;font-size:12px;"> ${(item.price||0).toLocaleString()} ${cur()} / وحدة</span></div>
+        ${hasSerials ? `
+        <div style="font-size:12px;color:#64748b;margin-bottom:6px;">📟 اختر السيريالات المعيبة:</div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;">
+          ${item.serials.map(serial=>`
+            <label style="display:flex;align-items:center;gap:5px;background:#161923;border:1px solid #2d3349;border-radius:6px;padding:5px 10px;cursor:pointer;font-size:12px;font-family:monospace;color:#cbd5e1;">
+              <input type="checkbox" class="war-serial-cb" data-product="${item.product_id}" data-serial="${esc(serial)}" style="width:14px;height:14px;"/>
+              ${esc(serial)}
+            </label>`).join('')}
+        </div>
+        <div class="war-rep" style="margin-top:8px;">
+          <label class="lbl" style="font-size:12px;">السيريالات البديلة (افصل بينها بفاصلة، بنفس عدد المعيبة)</label>
+          <input class="inp war-rep-inp" data-product="${item.product_id}" style="font-family:monospace;" placeholder="SN-101, SN-102"/>
+        </div>` : `
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span style="font-size:12px;color:#94a3b8;">الكمية المباعة: ${item.qty}</span>
+          <input class="inp war-qty" data-product="${item.product_id}" type="number" value="0" min="0" max="${item.qty}" style="width:80px;padding:4px 8px;"/>
+        </div>`}
+      </div>`;
+    }).join('')}
+  </div>
+  <div style="display:flex;gap:10px;">
+    <button class="btn p" style="background:linear-gradient(135deg,#1e40af,#1e3a8a);" id="ms">🛡️ تأكيد المعالجة</button>
+    <button class="btn s" id="mc2">إلغاء</button>
+  </div>
+  </div></div>`;
+}
+
+// ── قائمة مطالبات الكفالة (القطع المعيبة): إرسال للمورد / عودة للمخزون / شطب ──
+window.openWarrantyClaims = async function(){
+  MS = {type:'warrantyclaims', data:{rows:[], loading:true}};
+  render();
+  try{
+    const rows = await api('GET','/api/warranty_claims');
+    MS = {type:'warrantyclaims', data:{rows, loading:false}};
+  }catch(e){ MS = {type:'warrantyclaims', data:{rows:[], loading:false, error:e.message}}; }
+  render();
+};
+window.warrantyClaimStatus = async function(id, status){
+  const msg = status==='عاد للمخزون' ? 'ستعود القطعة (أو الكمية) إلى المخزون كسليمة. متابعة؟'
+            : status==='مشطوب' ? 'ستُشطب القطعة نهائيًا ولن تعود للمخزون. متابعة؟' : 'تغيير الحالة إلى: '+status+'؟';
+  if(!confirm(msg)) return;
+  try{ await api('PUT','/api/warranty_claims/'+id, {status}); await loadAll(); await openWarrantyClaims(); }
+  catch(e){ alert('خطأ: '+e.message); }
+};
+function warrantyClaimsModal(d){
+  const rows = d.rows||[];
+  const badge = st => st==='معيب عندنا' ? 'r' : st==='مرسل للمورد' ? 'y' : st==='عاد للمخزون' ? 'g' : 'b';
+  return `<div class="overlay" id="mover"><div class="modal" style="max-width:900px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+    <div style="font-size:16px;font-weight:800;color:#f1f5f9;">🛡️ مطالبات الكفالة</div>
+    <button class="btn s" style="padding:4px 9px;" id="mc">✕</button>
+  </div>
+  ${d.error?`<div class="err">${esc(d.error)}</div>`:''}
+  ${d.loading?'<div style="text-align:center;color:#64748b;padding:30px;">جارٍ التحميل...</div>':
+  (!rows.length?'<div style="text-align:center;color:#64748b;padding:30px;">لا توجد مطالبات كفالة</div>':`
+  <div class="card" style="overflow-x:auto;"><table>
+    <thead><tr><th>التاريخ</th><th>الزبون</th><th>المنتج</th><th>الكمية / السيريال</th><th>المعالجة</th><th>العطل</th><th>الحالة</th><th>إجراءات</th></tr></thead>
+    <tbody>${rows.map(r=>`<tr>
+      <td>${r.date||'—'}</td>
+      <td>${esc(r.customer_name||'زبون عام')}<div style="font-size:11px;color:#64748b;">فاتورة #${r.sale_id}</div></td>
+      <td>${esc(r.product_name||('#'+r.product_id))}</td>
+      <td>${r.qty}${r.serials?`<div style="font-size:11px;font-family:monospace;color:#94a3b8;">${esc(r.serials)}${r.replacement_serials?' ← '+esc(r.replacement_serials):''}</div>`:''}</td>
+      <td>${r.resolution==='replace'?'🔁 استبدال':'💵 استرداد'}</td>
+      <td style="font-size:12px;color:#94a3b8;">${esc(r.reason||'—')}</td>
+      <td><span class="badge ${badge(r.status)}">${r.status}</span></td>
+      <td>${(r.status==='معيب عندنا'||r.status==='مرسل للمورد')?`<div style="display:flex;gap:4px;flex-wrap:wrap;">
+        ${r.status==='معيب عندنا'?`<button class="btn s" style="padding:3px 8px;font-size:11px;" onclick="warrantyClaimStatus(${r.id},'مرسل للمورد')">📦 للمورد</button>`:''}
+        <button class="btn s" style="padding:3px 8px;font-size:11px;color:#52b788;" onclick="warrantyClaimStatus(${r.id},'عاد للمخزون')">✅ عادت سليمة</button>
+        <button class="btn d" style="padding:3px 8px;font-size:11px;" onclick="warrantyClaimStatus(${r.id},'مشطوب')">🗑️ شطب</button>
+      </div>`:'—'}</td></tr>`).join('')}</tbody>
+  </table></div>`)}
   </div></div>`;
 }
 
@@ -9133,6 +9378,39 @@ function bindModal(){
     };
   }
 
+  // ── مردود كفالة ──
+  if(MS?.type==='warrantysale'){
+    document.getElementById('ms').onclick=async()=>{
+      const errEl = document.getElementById('merr');
+      const sale  = MS.data||{};
+      const resolution = document.getElementById('war-res')?.value||'replace';
+      const date  = document.getElementById('war-date')?.value||new Date().toISOString().slice(0,10);
+      const notes = document.getElementById('war-notes')?.value||'';
+      const map = {};
+      document.querySelectorAll('.war-serial-cb:checked').forEach(cb=>{
+        const pid = parseInt(cb.dataset.product);
+        if(!map[pid]) map[pid] = {product_id:pid, qty:0, serials:[], replacement_serials:[]};
+        map[pid].qty += 1; map[pid].serials.push(cb.dataset.serial);
+      });
+      Object.keys(map).forEach(pid=>{
+        const inp = document.querySelector('.war-rep-inp[data-product="'+pid+'"]');
+        map[pid].replacement_serials = (inp?.value||'').split(',').map(x=>x.trim()).filter(Boolean);
+      });
+      document.querySelectorAll('.war-qty').forEach(inp=>{
+        const qty = parseInt(inp.value)||0;
+        if(qty>0){ const pid = parseInt(inp.dataset.product); map[pid] = {product_id:pid, qty, serials:[], replacement_serials:[]}; }
+      });
+      const itemsArr = Object.values(map);
+      if(!itemsArr.length){ errEl.innerHTML = '<div class="err">حدد صنفًا معيبًا واحدًا على الأقل</div>'; return; }
+      try{
+        const r = await api('POST','/api/warranty_return', {sale_id: sale.id, date, notes, resolution, items: itemsArr});
+        await loadAll(); closeM();
+        alert(resolution==='replace' ? '✅ تم تسجيل الاستبدال. القطعة المعيبة محفوظة في مطالبات الكفالة (صفحة المخازن).'
+                                     : '✅ تم استرداد المبلغ وتسجيل القطعة المعيبة في مطالبات الكفالة.');
+      }catch(e){ errEl.innerHTML = '<div class="err">'+e.message+'</div>'; }
+    };
+  }
+
   // ── مردود مبيعات (إرجاع من الزبون) ──
   if(MS?.type==='returnsale'){
     document.getElementById('ms').onclick=async()=>{
@@ -10203,6 +10481,7 @@ function salesListModal(){
           ${!isReturn?`<button class="btn s" style="padding:3px 8px;font-size:11px;" onclick="openEditSale(${s.id})">✏️ تعديل</button>`:''}
           ${!isReturn?`<button class="btn p" style="padding:3px 8px;font-size:11px;background:linear-gradient(135deg,#1e40af,#1e3a8a);" onclick="openPay(${s.id},'sale')">💳</button>`:''}
           ${!isReturn?`<button class="btn s" style="padding:3px 8px;font-size:11px;color:#fbbf24;border-color:#5c4a23;" onclick="returnSale(${s.id})">↩️ مردود</button>`:''}
+          ${!isReturn?`<button class="btn s" style="padding:3px 8px;font-size:11px;color:#60a5fa;border-color:#1e3a5f;" onclick="warrantySale(${s.id})">🛡️ كفالة</button>`:''}
           <button class="btn d" style="padding:3px 8px;font-size:11px;" onclick="deleteSale(${s.id})">🗑️</button>
         </div></td>
       </tr>`;
