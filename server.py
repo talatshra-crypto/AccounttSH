@@ -1430,20 +1430,76 @@ class BackupDAO(BaseDAO):
 
 class ReportsDAO(BaseDAO):
     @staticmethod
-    def _sup_movements(c, sup_id, date_from, date_to=None):
-        """حركات مورد ضمن نطاق تاريخ. إن لم يُمرَّر date_to فالنطاق = كل ما قبل date_from (للرصيد السابق).
-        يعيد: مشتريات (فواتير موجبة)، مردودات مشتريات (قيمة موجبة)، دفعات."""
-        if date_to is None: w, pr = "date<?", [date_from]
-        else:               w, pr = "date>=? AND date<=?", [date_from, date_to]
-        purchases, returns = c.execute(
-            f"SELECT COALESCE(SUM(CASE WHEN total>0 THEN total ELSE 0 END),0), "
-            f"COALESCE(SUM(CASE WHEN total<0 THEN -total ELSE 0 END),0) "
-            f"FROM purchases WHERE (CAST(supplier_id AS INTEGER)=? OR supplier_id=?) AND {w}",
-            [sup_id, str(sup_id)]+pr).fetchone()
-        payments = c.execute(
-            f"SELECT COALESCE(SUM(amount),0) FROM payments "
-            f"WHERE party_type='supplier' AND party_id=? AND {w}", [sup_id]+pr).fetchone()[0]
-        return {"purchases": purchases, "returns": returns, "payments": payments}
+    def _party_ledger(c, party_type, pid, opening):
+        """سجل حركات كامل لزبون أو مورد مرتب زمنياً، وفي كل حركة الرصيد بعدها.
+        الرصيد = الافتتاحي + زيادات (فواتير بيع/خدمات أو مشتريات) − نقصان (دفعات، مردودات).
+        الفاتورة بحالة «مدفوع» ولا دفعات مسجّلة لها تُعدّ مسدّدة وقت إصدارها (لا تزيد الرصيد)."""
+        is_cust = party_type == "customer"
+        pays = BaseDAO.rows(c.execute(
+            "SELECT id, ref_type, ref_id, amount, method, date FROM payments WHERE party_type=? AND party_id=?",
+            (party_type, pid)))
+        by_ref = {}
+        for pay in pays:
+            by_ref[(pay["ref_type"], pay["ref_id"])] = by_ref.get((pay["ref_type"], pay["ref_id"]), 0) + (pay["amount"] or 0)
+        entries = []
+        def add(date, order, kind, rid, desc, debit, credit, pay_id=0):
+            if debit or credit:
+                entries.append({"date": date or "", "order": order, "kind": kind, "id": rid, "desc": desc,
+                                "debit": round(debit, 4), "credit": round(credit, 4), "_k": pay_id or rid})
+        if is_cust:
+            for r in BaseDAO.rows(c.execute(
+                    "SELECT id,date,total,status FROM sales WHERE CAST(customer_id AS INTEGER)=?", (pid,))):
+                tot = r["total"] or 0
+                if tot < 0 or r["status"] == "مردود":
+                    add(r["date"], 0, "sale", r["id"], f"مردود مبيعات #{r['id']}", 0, abs(tot))
+                else:
+                    settled = max(0, tot - by_ref.get(("sale", r["id"]), 0)) if r["status"] == "مدفوع" else 0
+                    add(r["date"], 0, "sale", r["id"], f"فاتورة بيع #{r['id']}" + (" (مدفوعة)" if settled else ""), tot, settled)
+            for r in BaseDAO.rows(c.execute(
+                    "SELECT id,received_date AS date,service_fee,payment_status FROM service_orders "
+                    "WHERE CAST(customer_id AS INTEGER)=?", (pid,))):
+                fee = r["service_fee"] or 0
+                settled = max(0, fee - by_ref.get(("service", r["id"]), 0)) if r["payment_status"] == "مدفوع" else 0
+                add(r["date"], 0, "service", r["id"], f"خدمة #{r['id']}" + (" (مدفوعة)" if settled else ""), fee, settled)
+        else:
+            for r in BaseDAO.rows(c.execute(
+                    "SELECT id,date,total,status FROM purchases WHERE CAST(supplier_id AS INTEGER)=?", (pid,))):
+                tot = r["total"] or 0
+                if tot < 0 or r["status"] == "مردود":
+                    add(r["date"], 0, "purchase", r["id"], f"مردود مشتريات #{r['id']}", 0, abs(tot))
+                else:
+                    settled = max(0, tot - by_ref.get(("purchase", r["id"]), 0)) if r["status"] == "مدفوع" else 0
+                    add(r["date"], 0, "purchase", r["id"], f"فاتورة شراء #{r['id']}" + (" (مدفوعة)" if settled else ""), tot, settled)
+        names = {"account": "دفعة على الحساب", "sale": "دفعة على فاتورة بيع", "service": "دفعة على خدمة", "purchase": "دفعة على فاتورة شراء"}
+        for pay in pays:
+            label = names.get(pay["ref_type"], "دفعة")
+            if pay["ref_type"] != "account": label += f" #{pay['ref_id']}"
+            if pay["method"] == "شيك": label += " (شيك)"
+            add(pay["date"], 1, "payment", pay["id"], label, 0, pay["amount"] or 0)
+        entries.sort(key=lambda e: (e["date"], e["order"], e["_k"]))
+        bal = opening
+        for e in entries:
+            bal = round(bal + e["debit"] - e["credit"], 4)
+            e["balance"] = bal
+            del e["order"], e["_k"]
+        return entries
+
+    @staticmethod
+    def _apply_ledger(c, party_type, pid, opening, date_from, date_to):
+        """يحسب من السجل: الرصيد السابق، حركات الفترة مع الرصيد بعد كل حركة، والرصيد الختامي."""
+        led = ReportsDAO._party_ledger(c, party_type, pid, opening)
+        previous = opening
+        for e in led:
+            if e["date"] < date_from: previous = e["balance"]
+        period = [e for e in led if date_from <= e["date"] <= date_to]
+        closing = period[-1]["balance"] if period else previous
+        debit = sum(e["debit"] for e in period)
+        credit = sum(e["credit"] for e in period)
+        kinds_ret = ("مردود",)
+        returns = sum(e["credit"] for e in period if e["desc"].startswith("مردود"))
+        return {"previous_balance": previous, "ledger": period, "closing_balance": closing,
+                "period_debit": debit, "period_credit": credit,
+                "period_returns": returns, "period_payments": credit - returns}
 
     @staticmethod
     def supplier_report(c, sup_id, date_from, date_to):
@@ -1465,42 +1521,13 @@ class ReportsDAO(BaseDAO):
         total_paid_final = total_paid + account_paid
         total_remain = max(0, total_remain_inv + opening_balance - account_paid)
         all_payments = PaymentsDAO.get_by_party(c, "supplier", sup_id)
-        # الرصيد السابق (المستحق للمورد) = الرصيد الافتتاحي + مشتريات − مردودات − دفعات لكل ما قبل date_from
-        prev = ReportsDAO._sup_movements(c, sup_id, date_from)
-        previous_balance = opening_balance + prev["purchases"] - prev["returns"] - prev["payments"]
-        per = ReportsDAO._sup_movements(c, sup_id, date_from, date_to)
-        period_debit = per["purchases"]
-        period_credit = per["returns"] + per["payments"]
-        closing_balance = previous_balance + period_debit - period_credit
+        led = ReportsDAO._apply_ledger(c, "supplier", sup_id, opening_balance, date_from, date_to)
+        after = {e["id"]: e["balance"] for e in led["ledger"] if e["kind"] == "purchase"}
+        for p_ in ps: p_["balance_after"] = after.get(p_["id"])
         return {"supplier": sup, "purchases": ps, "total": total_sup,
                 "total_paid": total_paid_final, "total_remaining": total_remain,
                 "account_paid": account_paid, "opening_balance": opening_balance, "all_payments": all_payments,
-                "date_from": date_from, "date_to": date_to, "count": len(ps),
-                "previous_balance": previous_balance, "period_debit": period_debit,
-                "period_returns": per["returns"], "period_payments": per["payments"],
-                "period_credit": period_credit, "closing_balance": closing_balance}
-
-    @staticmethod
-    def _cust_movements(c, cust_id, date_from, date_to=None):
-        """حركات زبون ضمن نطاق تاريخ. إن لم يُمرَّر date_to فالنطاق = كل ما قبل date_from (للرصيد السابق).
-        يعيد: مبيعات (فواتير موجبة)، خدمات، مردودات (قيمة موجبة)، دفعات."""
-        def rng(col):
-            if date_to is None: return f"{col}<?", [date_from]
-            return f"{col}>=? AND {col}<=?", [date_from, date_to]
-        w, pr = rng("date")
-        sales_pos, returns = c.execute(
-            f"SELECT COALESCE(SUM(CASE WHEN total>0 THEN total ELSE 0 END),0), "
-            f"COALESCE(SUM(CASE WHEN total<0 THEN -total ELSE 0 END),0) "
-            f"FROM sales WHERE CAST(customer_id AS INTEGER)=? AND {w}", [cust_id]+pr).fetchone()
-        w, pr = rng("received_date")
-        services = c.execute(
-            f"SELECT COALESCE(SUM(service_fee),0) FROM service_orders "
-            f"WHERE CAST(customer_id AS INTEGER)=? AND {w}", [cust_id]+pr).fetchone()[0]
-        w, pr = rng("date")
-        payments = c.execute(
-            f"SELECT COALESCE(SUM(amount),0) FROM payments "
-            f"WHERE party_type='customer' AND party_id=? AND {w}", [cust_id]+pr).fetchone()[0]
-        return {"sales": sales_pos, "services": services, "returns": returns, "payments": payments}
+                "date_from": date_from, "date_to": date_to, "count": len(ps), **led}
 
     @staticmethod
     def customer_report(c, cust_id, date_from, date_to):
@@ -1548,20 +1575,13 @@ class ReportsDAO(BaseDAO):
         total_paid_final = total_paid + account_paid
         total_remain = max(0, total_remain_inv + opening_balance - account_paid)
         all_payments = PaymentsDAO.get_by_party(c, "customer", cust_id)
-        # الرصيد السابق = الرصيد الافتتاحي + (مبيعات وخدمات − مردودات − دفعات) لكل ما قبل date_from
-        prev = ReportsDAO._cust_movements(c, cust_id, date_from)
-        previous_balance = opening_balance + prev["sales"] + prev["services"] - prev["returns"] - prev["payments"]
-        per = ReportsDAO._cust_movements(c, cust_id, date_from, date_to)
-        period_debit = per["sales"] + per["services"]
-        period_credit = per["returns"] + per["payments"]
-        closing_balance = previous_balance + period_debit - period_credit
+        led = ReportsDAO._apply_ledger(c, "customer", cust_id, opening_balance, date_from, date_to)
+        after = {(e["kind"], e["id"]): e["balance"] for e in led["ledger"] if e["kind"] in ("sale", "service")}
+        for t in transactions: t["balance_after"] = after.get((t["kind"], t["id"]))
         return {"customer": cust, "sales": ss, "services": sos, "transactions": transactions, "total": total_s,
                 "total_paid": total_paid_final, "total_remaining": total_remain,
                 "account_paid": account_paid, "opening_balance": opening_balance, "all_payments": all_payments,
-                "date_from": date_from, "date_to": date_to, "count": len(transactions),
-                "previous_balance": previous_balance, "period_debit": period_debit,
-                "period_returns": per["returns"], "period_payments": per["payments"],
-                "period_credit": period_credit, "closing_balance": closing_balance}
+                "date_from": date_from, "date_to": date_to, "count": len(transactions), **led}
 
     @staticmethod
     def cheques_report(c, direction, status, date_from, date_to):
@@ -6088,6 +6108,7 @@ function custSaleCardHTML(s){
           <span style="color:#64748b;">مدفوع: </span><span style="color:#52b788;font-weight:700;">${(s.paid||0).toLocaleString()} ${cur()}</span>
           ${(s.remaining||0)>0?`<span style="color:#64748b;margin-right:8px;"> متبقي: </span><span style="color:#fbbf24;font-weight:700;">${(s.remaining||0).toLocaleString()} ${cur()}</span>`:''}
         </div>
+        ${s.balance_after!=null?`<span style="font-size:11px;color:#94a3b8;">الرصيد بعد: ${custBalText(s.balance_after)}</span>`:''}
         <span style="font-weight:900;color:#f1f5f9;font-size:15px;">${(s.total||0).toLocaleString()} ${cur()}</span>
       </div>
     </div>
@@ -6125,6 +6146,7 @@ function custServiceCardHTML(so){
           <span style="color:#64748b;">مدفوع: </span><span style="color:#52b788;font-weight:700;">${(so.paid||0).toLocaleString()} ${cur()}</span>
           ${(so.remaining||0)>0?`<span style="color:#64748b;margin-right:8px;"> متبقي: </span><span style="color:#fbbf24;font-weight:700;">${(so.remaining||0).toLocaleString()} ${cur()}</span>`:''}
         </div>
+        ${so.balance_after!=null?`<span style="font-size:11px;color:#94a3b8;">الرصيد بعد: ${custBalText(so.balance_after)}</span>`:''}
         <span style="font-weight:900;color:#f1f5f9;font-size:15px;">${(so.total||0).toLocaleString()} ${cur()}</span>
       </div>
     </div>
@@ -6154,6 +6176,31 @@ function custServiceCardHTML(so){
   </div>`;
 }
 
+function ledgerRows(d){
+  return [{'التاريخ':'','البيان':'رصيد سابق (قبل '+d.date_from+')','مدين':'','دائن':'','الرصيد بعد العملية': d.previous_balance||0}]
+    .concat((d.ledger||[]).map(e=>({'التاريخ':e.date,'البيان':e.desc,'مدين':e.debit||'','دائن':e.credit||'','الرصيد بعد العملية':e.balance})))
+    .concat([{'التاريخ':'','البيان':'الرصيد الختامي (حتى '+d.date_to+')','مدين':d.period_debit||0,'دائن':d.period_credit||0,'الرصيد بعد العملية': d.closing_balance||0}]);
+}
+function ledgerTableHTML(d, balFn){
+  const led = d.ledger||[];
+  const f = v => (Math.round((v||0)*100)/100).toLocaleString();
+  const lbl = d.date_from ? `قبل ${d.date_from}` : '';
+  return `<div class="card" style="margin-bottom:12px;overflow-x:auto;">
+    <div style="padding:10px 14px;font-weight:800;color:#f1f5f9;border-bottom:1px solid #1e2537;">📒 كشف الحركات مع الرصيد بعد كل عملية</div>
+    <table>
+      <thead><tr><th>التاريخ</th><th>البيان</th><th>مدين (+)</th><th>دائن (−)</th><th>الرصيد بعد العملية</th></tr></thead>
+      <tbody>
+        <tr style="background:#161923;"><td>—</td><td style="font-weight:700;">رصيد سابق (${lbl})</td><td></td><td></td><td style="font-weight:800;">${balFn(d.previous_balance)}</td></tr>
+        ${led.map(e=>`<tr>
+          <td>${e.date||'—'}</td><td>${esc(e.desc)}</td>
+          <td style="color:#f1f5f9;">${e.debit?f(e.debit)+' '+cur():''}</td>
+          <td style="color:#52b788;">${e.credit?f(e.credit)+' '+cur():''}</td>
+          <td style="font-weight:700;">${balFn(e.balance)}</td></tr>`).join('') || '<tr><td colspan="5" style="text-align:center;color:#64748b;padding:14px;">لا توجد حركات في هذه الفترة</td></tr>'}
+        <tr style="background:#161923;"><td>—</td><td style="font-weight:800;">الرصيد الختامي (حتى ${d.date_to})</td><td style="font-weight:700;">${f(d.period_debit)} ${cur()}</td><td style="font-weight:700;color:#52b788;">${f(d.period_credit)} ${cur()}</td><td style="font-weight:900;">${balFn(d.closing_balance)}</td></tr>
+      </tbody>
+    </table>
+  </div>`;
+}
 function custBalText(v){
   v = Math.round((v||0)*100)/100;
   const col = v>0 ? '#fbbf24' : v<0 ? '#60a5fa' : '#52b788';
@@ -6193,6 +6240,7 @@ function custRepHTML(d){
       <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">الرصيد الختامي (حتى ${date_to})</div><div style="font-size:18px;font-weight:900;margin-top:4px;">${custBalText(closing_balance)}</div></div>
     </div>
   </div>
+  ${ledgerTableHTML(d, custBalText)}
   ${(tx||[]).map(t=>t.kind==='service'?custServiceCardHTML(t):custSaleCardHTML(t)).join('')||'<div class="card" style="padding:28px;text-align:center;color:#475569;">لا توجد عمليات في هذه الفترة</div>'}
 
   ${(all_payments&&all_payments.length>0)?`
@@ -6276,6 +6324,7 @@ function supRepHTML(d){
       <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">الرصيد الختامي (حتى ${date_to})</div><div style="font-size:18px;font-weight:900;margin-top:4px;">${supBalText(closing_balance)}</div></div>
     </div>
   </div>
+  ${ledgerTableHTML(d, supBalText)}
   ${ps.map(p=>`
   <div class="card" style="margin-bottom:12px;overflow:hidden;">
     <div style="background:#1a1d27;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;">
@@ -6289,6 +6338,7 @@ function supRepHTML(d){
           <span style="color:#64748b;">مدفوع: </span><span style="color:#52b788;font-weight:700;">${(p.paid||0).toLocaleString()} ${cur()}</span>
           ${(p.remaining||0)>0?`<span style="color:#64748b;margin-right:8px;"> متبقي: </span><span style="color:#f87171;font-weight:700;">${(p.remaining||0).toLocaleString()} ${cur()}</span>`:''}
         </div>
+        ${p.balance_after!=null?`<span style="font-size:11px;color:#94a3b8;">الرصيد بعد: ${supBalText(p.balance_after)}</span>`:''}
         <span style="font-weight:900;color:#f1f5f9;font-size:15px;">${(p.total||0).toLocaleString()} ${cur()}</span>
       </div>
     </div>
@@ -6417,6 +6467,7 @@ window.exportSupplierExcel = function(d){
 
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), 'ملخص');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(ledgerRows(d)), 'الحركات');
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(invoiceRows), 'الفواتير');
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(paymentRows), 'الدفعات');
   XLSX.writeFile(wb, `كشف_حساب_${s.name}_${d.date_from}_${d.date_to}.xlsx`);
@@ -6463,6 +6514,7 @@ window.exportCustomerExcel = function(d){
 
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryRows), 'ملخص');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(ledgerRows(d)), 'الحركات');
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(txRows), 'العمليات');
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(paymentRows), 'الدفعات');
   XLSX.writeFile(wb, `كشف_حساب_${c.name}_${d.date_from}_${d.date_to}.xlsx`);
