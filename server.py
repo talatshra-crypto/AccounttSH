@@ -6108,7 +6108,7 @@ function custSaleCardHTML(s){
           <span style="color:#64748b;">مدفوع: </span><span style="color:#52b788;font-weight:700;">${(s.paid||0).toLocaleString()} ${cur()}</span>
           ${(s.remaining||0)>0?`<span style="color:#64748b;margin-right:8px;"> متبقي: </span><span style="color:#fbbf24;font-weight:700;">${(s.remaining||0).toLocaleString()} ${cur()}</span>`:''}
         </div>
-        ${s.balance_after!=null?`<span style="font-size:11px;color:#94a3b8;">الرصيد بعد: ${custBalText(s.balance_after)}</span>`:''}
+        ${s.balance_after!=null?`<span style="font-size:12px;background:#0f1117;border:1px solid #2d3349;border-radius:6px;padding:3px 8px;">الرصيد بعد: ${custBalText(s.balance_after)}</span>`:''}
         <span style="font-weight:900;color:#f1f5f9;font-size:15px;">${(s.total||0).toLocaleString()} ${cur()}</span>
       </div>
     </div>
@@ -6146,7 +6146,7 @@ function custServiceCardHTML(so){
           <span style="color:#64748b;">مدفوع: </span><span style="color:#52b788;font-weight:700;">${(so.paid||0).toLocaleString()} ${cur()}</span>
           ${(so.remaining||0)>0?`<span style="color:#64748b;margin-right:8px;"> متبقي: </span><span style="color:#fbbf24;font-weight:700;">${(so.remaining||0).toLocaleString()} ${cur()}</span>`:''}
         </div>
-        ${so.balance_after!=null?`<span style="font-size:11px;color:#94a3b8;">الرصيد بعد: ${custBalText(so.balance_after)}</span>`:''}
+        ${so.balance_after!=null?`<span style="font-size:12px;background:#0f1117;border:1px solid #2d3349;border-radius:6px;padding:3px 8px;">الرصيد بعد: ${custBalText(so.balance_after)}</span>`:''}
         <span style="font-weight:900;color:#f1f5f9;font-size:15px;">${(so.total||0).toLocaleString()} ${cur()}</span>
       </div>
     </div>
@@ -6181,25 +6181,32 @@ function ledgerRows(d){
     .concat((d.ledger||[]).map(e=>({'التاريخ':e.date,'البيان':e.desc,'مدين':e.debit||'','دائن':e.credit||'','الرصيد بعد العملية':e.balance})))
     .concat([{'التاريخ':'','البيان':'الرصيد الختامي (حتى '+d.date_to+')','مدين':d.period_debit||0,'دائن':d.period_credit||0,'الرصيد بعد العملية': d.closing_balance||0}]);
 }
-function ledgerTableHTML(d, balFn){
+function ledgerTimelineHTML(d, balFn, invoices, keyOfInvoice, cardOf, emptyMsg){
   const led = d.ledger||[];
   const f = v => (Math.round((v||0)*100)/100).toLocaleString();
-  const lbl = d.date_from ? `قبل ${d.date_from}` : '';
-  return `<div class="card" style="margin-bottom:12px;overflow-x:auto;">
-    <div style="padding:10px 14px;font-weight:800;color:#f1f5f9;border-bottom:1px solid #1e2537;">📒 كشف الحركات مع الرصيد بعد كل عملية</div>
-    <table>
-      <thead><tr><th>التاريخ</th><th>البيان</th><th>مدين (+)</th><th>دائن (−)</th><th>الرصيد بعد العملية</th></tr></thead>
-      <tbody>
-        <tr style="background:#161923;"><td>—</td><td style="font-weight:700;">رصيد سابق (${lbl})</td><td></td><td></td><td style="font-weight:800;">${balFn(d.previous_balance)}</td></tr>
-        ${led.map(e=>`<tr>
-          <td>${e.date||'—'}</td><td>${esc(e.desc)}</td>
-          <td style="color:#f1f5f9;">${e.debit?f(e.debit)+' '+cur():''}</td>
-          <td style="color:#52b788;">${e.credit?f(e.credit)+' '+cur():''}</td>
-          <td style="font-weight:700;">${balFn(e.balance)}</td></tr>`).join('') || '<tr><td colspan="5" style="text-align:center;color:#64748b;padding:14px;">لا توجد حركات في هذه الفترة</td></tr>'}
-        <tr style="background:#161923;"><td>—</td><td style="font-weight:800;">الرصيد الختامي (حتى ${d.date_to})</td><td style="font-weight:700;">${f(d.period_debit)} ${cur()}</td><td style="font-weight:700;color:#52b788;">${f(d.period_credit)} ${cur()}</td><td style="font-weight:900;">${balFn(d.closing_balance)}</td></tr>
-      </tbody>
-    </table>
-  </div>`;
+  const byKey = {}; (invoices||[]).forEach(inv=>{ byKey[keyOfInvoice(inv)] = inv; });
+  const used = {};
+  const strip = (title, bal, extra) => `<div class="card" style="margin-bottom:12px;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;background:#161923;border:1px solid #2d3349;">
+      <div style="font-weight:800;color:#f1f5f9;">${title}</div>
+      <div style="display:flex;align-items:center;gap:16px;">${extra||''}<span style="font-weight:900;font-size:15px;">${balFn(bal)}</span></div></div>`;
+  const rows = led.map(e=>{
+    if(e.kind==='payment'){
+      return `<div class="card" style="margin-bottom:12px;padding:9px 14px;display:flex;justify-content:space-between;align-items:center;border:1px solid #1f3d2e;">
+        <div style="display:flex;align-items:center;gap:12px;"><span class="badge g" style="font-size:10px;">💳 دفعة</span>
+          <span style="font-weight:800;color:#f1f5f9;">📅 ${e.date||'—'}</span><span style="color:#94a3b8;font-size:13px;">${esc(e.desc)}</span></div>
+        <div style="display:flex;align-items:center;gap:14px;"><span style="font-weight:800;color:#52b788;">− ${f(e.credit)} ${cur()}</span>
+          <span style="font-size:12px;background:#0f1117;border:1px solid #2d3349;border-radius:6px;padding:3px 8px;">الرصيد بعد: ${balFn(e.balance)}</span></div></div>`;
+    }
+    const inv = byKey[e.kind+':'+e.id];
+    if(inv){ used[e.kind+':'+e.id] = 1; return cardOf(inv); }
+    return '';
+  }).join('');
+  const leftovers = (invoices||[]).filter(inv=>!used[keyOfInvoice(inv)]).map(cardOf).join('');
+  if(!rows && !leftovers) return `<div class="card" style="padding:28px;text-align:center;color:#475569;">${emptyMsg}</div>`;
+  return strip(`رصيد سابق (قبل ${d.date_from})`, d.previous_balance)
+    + rows + leftovers
+    + strip(`الرصيد الختامي (حتى ${d.date_to})`, d.closing_balance,
+        `<span style="font-size:12px;color:#94a3b8;">مدين: ${f(d.period_debit)} | دائن: ${f(d.period_credit)}</span>`);
 }
 function custBalText(v){
   v = Math.round((v||0)*100)/100;
@@ -6240,8 +6247,8 @@ function custRepHTML(d){
       <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">الرصيد الختامي (حتى ${date_to})</div><div style="font-size:18px;font-weight:900;margin-top:4px;">${custBalText(closing_balance)}</div></div>
     </div>
   </div>
-  ${ledgerTableHTML(d, custBalText)}
-  ${(tx||[]).map(t=>t.kind==='service'?custServiceCardHTML(t):custSaleCardHTML(t)).join('')||'<div class="card" style="padding:28px;text-align:center;color:#475569;">لا توجد عمليات في هذه الفترة</div>'}
+  ${ledgerTimelineHTML(d, custBalText, tx||[], t=>t.kind+':'+t.id,
+      t=>t.kind==='service'?custServiceCardHTML(t):custSaleCardHTML(t), 'لا توجد عمليات في هذه الفترة')}
 
   ${(all_payments&&all_payments.length>0)?`
   <div class="card" style="margin-bottom:12px;overflow:hidden;">
@@ -6298,34 +6305,8 @@ function supBalText(v){
   const lbl = v>0 ? 'علينا' : v<0 ? 'لنا' : 'مسدد';
   return `<span style="color:${col};">${Math.abs(v).toLocaleString()} ${cur()}</span> <span style="font-size:11px;color:#94a3b8;">${lbl}</span>`;
 }
-function supRepHTML(d){
-  const {supplier:s,purchases:ps,total,total_paid,total_remaining,all_payments,count,date_from,date_to,account_paid=0,opening_balance=0,
-         previous_balance=0,period_debit=0,period_credit=0,closing_balance=0}=d;
-  return `<div id="spa">
-  <div class="card" style="padding:18px;margin-bottom:12px;">
-    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;">
-      <div><div style="font-size:17px;font-weight:900;color:#f1f5f9;">كشف حساب مورد</div>
-        <div style="font-size:13px;color:#64748b;margin-top:3px;">الفترة: ${date_from} الى ${date_to}</div></div>
-      <div style="text-align:left;"><div style="font-size:15px;font-weight:800;color:#52b788;">${s.name}</div>
-        <div style="font-size:12px;color:#64748b;">${s.phone||''} ${s.city?'— '+s.city:''}</div></div>
-    </div>
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;">
-      <div class="stat"><div style="font-size:12px;color:#64748b;">عدد الفواتير</div><div style="font-size:18px;font-weight:800;color:#60a5fa;margin-top:4px;">${count}</div></div>
-      <div class="stat"><div style="font-size:12px;color:#64748b;">إجمالي المشتريات</div><div style="font-size:18px;font-weight:800;color:#f1f5f9;margin-top:4px;">${total.toLocaleString()} ${cur()}</div></div>
-      <div class="stat"><div style="font-size:12px;color:#64748b;">إجمالي المدفوع</div><div style="font-size:18px;font-weight:800;color:#52b788;margin-top:4px;">${(total_paid||0).toLocaleString()} ${cur()}</div>${account_paid>0?`<div style="font-size:10px;color:#94a3b8;margin-top:2px;">منها ${account_paid.toLocaleString()} ${cur()} دفعات مباشرة</div>`:''}</div>
-      <div class="stat"><div style="font-size:12px;color:#64748b;">المتبقي (مستحق)</div><div style="font-size:18px;font-weight:800;color:${(total_remaining||0)>0?'#f87171':'#52b788'};margin-top:4px;">${(total_remaining||0).toLocaleString()} ${cur()}</div>${opening_balance?`<div style="font-size:10px;color:#94a3b8;margin-top:2px;">شامل ${opening_balance.toLocaleString()} ${cur()} رصيد افتتاحي</div>`:''}</div>
-    </div>
-  </div>
-  <div class="card" style="padding:14px;margin-bottom:12px;background:linear-gradient(135deg,#1a2233,#161923);">
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;">
-      <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">الرصيد السابق (قبل ${date_from})</div><div style="font-size:18px;font-weight:900;margin-top:4px;">${supBalText(previous_balance)}</div></div>
-      <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">+ مشتريات الفترة</div><div style="font-size:18px;font-weight:800;color:#f1f5f9;margin-top:4px;">${(period_debit||0).toLocaleString()} ${cur()}</div></div>
-      <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">− دفعات ومردودات الفترة</div><div style="font-size:18px;font-weight:800;color:#52b788;margin-top:4px;">${(period_credit||0).toLocaleString()} ${cur()}</div></div>
-      <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">الرصيد الختامي (حتى ${date_to})</div><div style="font-size:18px;font-weight:900;margin-top:4px;">${supBalText(closing_balance)}</div></div>
-    </div>
-  </div>
-  ${ledgerTableHTML(d, supBalText)}
-  ${ps.map(p=>`
+function supPurchaseCardHTML(p){
+  return `
   <div class="card" style="margin-bottom:12px;overflow:hidden;">
     <div style="background:#1a1d27;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;">
       <div style="display:flex;align-items:center;gap:12px;">
@@ -6338,7 +6319,7 @@ function supRepHTML(d){
           <span style="color:#64748b;">مدفوع: </span><span style="color:#52b788;font-weight:700;">${(p.paid||0).toLocaleString()} ${cur()}</span>
           ${(p.remaining||0)>0?`<span style="color:#64748b;margin-right:8px;"> متبقي: </span><span style="color:#f87171;font-weight:700;">${(p.remaining||0).toLocaleString()} ${cur()}</span>`:''}
         </div>
-        ${p.balance_after!=null?`<span style="font-size:11px;color:#94a3b8;">الرصيد بعد: ${supBalText(p.balance_after)}</span>`:''}
+        ${p.balance_after!=null?`<span style="font-size:12px;background:#0f1117;border:1px solid #2d3349;border-radius:6px;padding:3px 8px;">الرصيد بعد: ${supBalText(p.balance_after)}</span>`:''}
         <span style="font-weight:900;color:#f1f5f9;font-size:15px;">${(p.total||0).toLocaleString()} ${cur()}</span>
       </div>
     </div>
@@ -6377,7 +6358,35 @@ function supRepHTML(d){
       </tr>`).join('')}
       </tbody></table>
     </div>`:''}
-  </div>`).join('')||'<div class="card" style="padding:28px;text-align:center;color:#475569;">لا توجد مشتريات في هذه الفترة</div>'}
+  </div>`;
+}
+function supRepHTML(d){
+  const {supplier:s,purchases:ps,total,total_paid,total_remaining,all_payments,count,date_from,date_to,account_paid=0,opening_balance=0,
+         previous_balance=0,period_debit=0,period_credit=0,closing_balance=0}=d;
+  return `<div id="spa">
+  <div class="card" style="padding:18px;margin-bottom:12px;">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;">
+      <div><div style="font-size:17px;font-weight:900;color:#f1f5f9;">كشف حساب مورد</div>
+        <div style="font-size:13px;color:#64748b;margin-top:3px;">الفترة: ${date_from} الى ${date_to}</div></div>
+      <div style="text-align:left;"><div style="font-size:15px;font-weight:800;color:#52b788;">${s.name}</div>
+        <div style="font-size:12px;color:#64748b;">${s.phone||''} ${s.city?'— '+s.city:''}</div></div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;">
+      <div class="stat"><div style="font-size:12px;color:#64748b;">عدد الفواتير</div><div style="font-size:18px;font-weight:800;color:#60a5fa;margin-top:4px;">${count}</div></div>
+      <div class="stat"><div style="font-size:12px;color:#64748b;">إجمالي المشتريات</div><div style="font-size:18px;font-weight:800;color:#f1f5f9;margin-top:4px;">${total.toLocaleString()} ${cur()}</div></div>
+      <div class="stat"><div style="font-size:12px;color:#64748b;">إجمالي المدفوع</div><div style="font-size:18px;font-weight:800;color:#52b788;margin-top:4px;">${(total_paid||0).toLocaleString()} ${cur()}</div>${account_paid>0?`<div style="font-size:10px;color:#94a3b8;margin-top:2px;">منها ${account_paid.toLocaleString()} ${cur()} دفعات مباشرة</div>`:''}</div>
+      <div class="stat"><div style="font-size:12px;color:#64748b;">المتبقي (مستحق)</div><div style="font-size:18px;font-weight:800;color:${(total_remaining||0)>0?'#f87171':'#52b788'};margin-top:4px;">${(total_remaining||0).toLocaleString()} ${cur()}</div>${opening_balance?`<div style="font-size:10px;color:#94a3b8;margin-top:2px;">شامل ${opening_balance.toLocaleString()} ${cur()} رصيد افتتاحي</div>`:''}</div>
+    </div>
+  </div>
+  <div class="card" style="padding:14px;margin-bottom:12px;background:linear-gradient(135deg,#1a2233,#161923);">
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;">
+      <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">الرصيد السابق (قبل ${date_from})</div><div style="font-size:18px;font-weight:900;margin-top:4px;">${supBalText(previous_balance)}</div></div>
+      <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">+ مشتريات الفترة</div><div style="font-size:18px;font-weight:800;color:#f1f5f9;margin-top:4px;">${(period_debit||0).toLocaleString()} ${cur()}</div></div>
+      <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">− دفعات ومردودات الفترة</div><div style="font-size:18px;font-weight:800;color:#52b788;margin-top:4px;">${(period_credit||0).toLocaleString()} ${cur()}</div></div>
+      <div style="text-align:center;"><div style="font-size:12px;color:#94a3b8;">الرصيد الختامي (حتى ${date_to})</div><div style="font-size:18px;font-weight:900;margin-top:4px;">${supBalText(closing_balance)}</div></div>
+    </div>
+  </div>
+  ${ledgerTimelineHTML(d, supBalText, ps||[], p=>'purchase:'+p.id, supPurchaseCardHTML, 'لا توجد مشتريات في هذه الفترة')}
 
   ${(all_payments&&all_payments.length>0)?`
   <div class="card" style="margin-bottom:12px;overflow:hidden;">
