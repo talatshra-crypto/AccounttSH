@@ -1542,7 +1542,8 @@ class ReportsDAO(BaseDAO):
             p["items"] = PurchasesDAO.get_items(c, p["id"])
             p["payments"] = PaymentsDAO.get_by_ref(c, "purchase", p["id"])
             p["paid"] = sum(pay["amount"] for pay in p["payments"])
-            p["remaining"] = max(0, abs(p["total"]) - p["paid"])
+            # فاتورة مردود المشتريات ليست مستحقًا للمورد (بل تُخصم منه): متبقيها صفر
+            p["remaining"] = 0 if (p["total"] < 0 or p["status"] == "مردود") else max(0, p["total"] - p["paid"])
         total_sup = sum(p["total"] for p in ps)
         total_paid = sum(p["paid"] for p in ps)
         total_remain_inv = sum(p["remaining"] for p in ps)
@@ -1552,6 +1553,8 @@ class ReportsDAO(BaseDAO):
         total_remain = max(0, total_remain_inv + opening_balance - account_paid)
         all_payments = PaymentsDAO.get_by_party(c, "supplier", sup_id)
         led = ReportsDAO._apply_ledger(c, "supplier", sup_id, opening_balance, date_from, date_to)
+        # المتبقي المستحق = الرصيد الختامي من السجل (الافتتاحي + مشتريات − مردودات − دفعات) فيحسب المردود
+        total_remain = max(0, led["closing_balance"])
         after = {e["id"]: e["balance"] for e in led["ledger"] if e["kind"] == "purchase"}
         for p_ in ps: p_["balance_after"] = after.get(p_["id"])
         return {"supplier": sup, "purchases": ps, "total": total_sup,
@@ -1570,7 +1573,8 @@ class ReportsDAO(BaseDAO):
             s["items"] = SalesDAO.get_items(c, s["id"])
             s["payments"] = PaymentsDAO.get_by_ref(c, "sale", s["id"])
             s["paid"] = sum(pay["amount"] for pay in s["payments"])
-            s["remaining"] = max(0, abs(s["total"]) - s["paid"])
+            # فاتورة المردود ليست دَينًا على الزبون (بل تخصم منه): متبقيها صفر لا abs(الإجمالي)
+            s["remaining"] = 0 if (s["total"] < 0 or s["status"] == "مردود") else max(0, s["total"] - s["paid"])
         sos = BaseDAO.rows(c.execute(
             "SELECT * FROM service_orders WHERE CAST(customer_id AS INTEGER)=? AND received_date>=? AND received_date<=? ORDER BY received_date",
             (cust_id, date_from, date_to)))
@@ -1606,6 +1610,8 @@ class ReportsDAO(BaseDAO):
         total_remain = max(0, total_remain_inv + opening_balance - account_paid)
         all_payments = PaymentsDAO.get_by_party(c, "customer", cust_id)
         led = ReportsDAO._apply_ledger(c, "customer", cust_id, opening_balance, date_from, date_to)
+        # المتبقي المستحق = الرصيد الختامي من السجل (الافتتاحي + فواتير + خدمات − مردودات − دفعات) فيحسب المردود
+        total_remain = max(0, led["closing_balance"])
         after = {(e["kind"], e["id"]): e["balance"] for e in led["ledger"] if e["kind"] in ("sale", "service")}
         for t in transactions: t["balance_after"] = after.get((t["kind"], t["id"]))
         return {"customer": cust, "sales": ss, "services": sos, "transactions": transactions, "total": total_s,
@@ -1653,20 +1659,30 @@ class ReportsDAO(BaseDAO):
         if party_type == "supplier":
             party_row = SuppliersDAO.get_by_id(c, party_id)
             invs = BaseDAO.rows(c.execute(
-                "SELECT * FROM purchases WHERE CAST(supplier_id AS INTEGER)=? AND status!='مردود'", (party_id,)))
+                "SELECT * FROM purchases WHERE CAST(supplier_id AS INTEGER)=?", (party_id,)))
             for inv in invs:
+                if inv["total"] < 0 or inv["status"] == "مردود":
+                    # مردود مشتريات: يُنقص المستحق للمورد (إجمالي الفواتير بالسالب) ولا يُعدّ مستحقًا
+                    total_inv += -abs(inv["total"])
+                    result.append({**inv, "paid": 0, "remaining": 0, "ref_type": "purchase"})
+                    continue
                 paid = PaymentsDAO.total_by_ref(c, "purchase", inv["id"])
-                remaining = abs(inv["total"]) - paid
-                total_inv += abs(inv["total"]); total_paid_invoices += paid
+                remaining = inv["total"] - paid
+                total_inv += inv["total"]; total_paid_invoices += paid
                 result.append({**inv, "paid": paid, "remaining": remaining, "ref_type": "purchase"})
         else:
             party_row = CustomersDAO.get_by_id(c, party_id)
             invs = BaseDAO.rows(c.execute(
                 "SELECT * FROM sales WHERE CAST(customer_id AS INTEGER)=?", (party_id,)))
             for inv in invs:
+                if inv["total"] < 0 or inv["status"] == "مردود":
+                    # مردود مبيعات: يُنقص المستحق على الزبون (إجمالي الفواتير بالسالب) ولا يُعدّ دَينًا
+                    total_inv += inv["total"] if inv["total"] < 0 else -inv["total"]
+                    result.append({**inv, "paid": 0, "remaining": 0, "ref_type": "sale"})
+                    continue
                 paid = PaymentsDAO.total_by_ref(c, "sale", inv["id"])
-                remaining = abs(inv["total"]) - paid
-                total_inv += abs(inv["total"]); total_paid_invoices += paid
+                remaining = inv["total"] - paid
+                total_inv += inv["total"]; total_paid_invoices += paid
                 result.append({**inv, "paid": paid, "remaining": remaining, "ref_type": "sale"})
             svcs = BaseDAO.rows(c.execute(
                 "SELECT * FROM service_orders WHERE CAST(customer_id AS INTEGER)=?", (party_id,)))
@@ -3296,8 +3312,8 @@ function customerOverdueInfo(custId){
   let unpaid = [...unpaidSales, ...unpaidServices];
   if(!unpaid.length) return null;
 
-  // توزيع دفعات الحساب المباشرة على الفواتير الأقدم أولاً (FIFO)
-  let accPaid = customerAccountPaid(custId);
+  // توزيع دفعات الحساب المباشرة ومردودات المبيعات على الفواتير الأقدم أولاً (FIFO)
+  let accPaid = customerAccountPaid(custId) + customerReturnsCredit(custId);
   if(accPaid > 0){
     unpaid = unpaid.slice().sort((a,b)=> (a.date||'').localeCompare(b.date||'')).map(u=>({...u}));
     for(const inv of unpaid){
@@ -3336,15 +3352,25 @@ function customerAccountPaid(custId){
 }
 
 // إجمالي المستحق (غير المسدد) لمورد معيّن من جميع فواتير الشراء غير المردودة، مطروحاً منه دفعات الحساب المباشرة، مضافاً إليه الرصيد الافتتاحي
+// مجموع مردودات المشتريات لمورد (قيمة موجبة): تُخصم من المستحق له
+function supplierReturnsCredit(supId){
+  return purchases.filter(p=>parseInt(p.supplier_id)===parseInt(supId) && (p.status==='مردود' || (p.total||0)<0))
+    .reduce((t,p)=>t+Math.abs(p.total||0), 0);
+}
 function supplierPayable(supId){
   const sup = suppliers.find(s=>s.id===parseInt(supId));
   const openingBalance = parseFloat(sup?.balance||0) || 0;
-  const purs = purchases.filter(p=>parseInt(p.supplier_id)===parseInt(supId) && p.status!=='مردود');
+  const purs = purchases.filter(p=>parseInt(p.supplier_id)===parseInt(supId) && p.status!=='مردود' && (p.total||0)>=0);
   const invoicesDue = purs.reduce((t,p)=>t + Math.max(0, (p.total||0)-(p.paid||0)), 0);
-  return Math.max(0, invoicesDue + openingBalance - supplierAccountPaid(supId));
+  return Math.max(0, invoicesDue + openingBalance - supplierAccountPaid(supId) - supplierReturnsCredit(supId));
 }
 
 // إجمالي المستحق على زبون معيّن من كل مبيعاته وطلبات خدماته، مطروحاً منه دفعات الحساب المباشرة، مضافاً إليه الرصيد الافتتاحي
+// مجموع مردودات المبيعات لزبون (قيمة موجبة): تُخصم من المستحق عليه
+function customerReturnsCredit(custId){
+  return sales.filter(s=>parseInt(s.customer_id)===parseInt(custId) && (s.status==='مردود' || (s.total||0)<0))
+    .reduce((t,s)=>t+Math.abs(s.total||0), 0);
+}
 function customerReceivable(custId){
   const cust = customers.find(c=>c.id===parseInt(custId));
   const openingBalance = parseFloat(cust?.balance||0) || 0;
@@ -3352,7 +3378,7 @@ function customerReceivable(custId){
   const custServices = serviceOrders.filter(o=>parseInt(o.customer_id)===parseInt(custId));
   const invoicesDue = custSales.reduce((t,s)=>t + Math.max(0,(s.total||0)-(s.paid||0)), 0)
                     + custServices.reduce((t,o)=>t + Math.max(0,(o.service_fee||0)-(o.paid||0)), 0);
-  return Math.max(0, invoicesDue + openingBalance - customerAccountPaid(custId));
+  return Math.max(0, invoicesDue + openingBalance - customerAccountPaid(custId) - customerReturnsCredit(custId));
 }
 
 // الموردون الذين تجاوزت مستحقاتهم حد التنبيه المحدد بالإعدادات
@@ -10841,7 +10867,7 @@ function salesBodyHTML(){
   const rets = list.filter(salesIsReturn);
   const totalInv = inv.reduce((t,s)=>t+(s.total||0),0);
   const totalRet = rets.reduce((t,s)=>t+Math.abs(s.total||0),0);
-  const remaining = inv.reduce((t,s)=>t+Math.max(0,(s.total||0)-(s.paid||0)),0);
+  const remaining = Math.max(0, inv.reduce((t,s)=>t+Math.max(0,(s.total||0)-(s.paid||0)),0) - totalRet);   // المردودات تُخصم من المتبقي
   return `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:14px;">
       <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">عدد الفواتير</div><div style="font-size:18px;font-weight:800;color:#60a5fa;margin-top:5px;">${inv.length}</div></div>
       <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">إجمالي المبيعات</div><div style="font-size:18px;font-weight:800;color:#52b788;margin-top:5px;">${f(totalInv)} ${cur()}</div></div>
