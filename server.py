@@ -485,7 +485,7 @@ def check_auth(req):
 # ══════════════════════════════════════════════
 #  نظام الصلاحيات المخصصة (الصفحات + تبويبات التقارير)
 # ══════════════════════════════════════════════
-ALL_PAGES = ["dashboard","products","warehouse","purchases","pos","suppliers","customers",
+ALL_PAGES = ["dashboard","products","warehouse","purchases","pos","sales","suppliers","customers",
              "accounting","expenses","services","quotes","reports","settings"]
 ALL_REPORT_TABS = ["sales","detailed","top-products","purchases","expenses-report","sup-compare",
                     "cheques","sup-detail","cust-detail","customers","suppliers-summary","inventory"]
@@ -545,6 +545,10 @@ def validate_permissions_payload(payload):
 
 def user_can_page(user, page):
     return page in effective_permissions(user).get("pages", [])
+
+def user_can_sales(user):
+    """صلاحية عمليات المبيعات (تعديل بنود/مردود/كفالة): من نقطة البيع أو من صفحة المبيعات."""
+    return user_can_page(user, "pos") or user_can_page(user, "sales")
 
 
 #  DAO Classes (Data Access Objects)
@@ -894,6 +898,32 @@ class SalesDAO(BaseDAO):
     @staticmethod
     def delete(c, sid):
         c.execute("DELETE FROM sales WHERE id=?", (sid,))
+    @staticmethod
+    def return_unit_values(orig_sale, pid):
+        """سعر الوحدة الصافي (بعد خصم البند وخصم الفاتورة) وتكلفتها من الفاتورة الأصلية — ليُحسب المردود
+        من الفاتورة نفسها لا من قيمة يرسلها المتصفح. يعيد (net_unit_price, unit_cost أو None)."""
+        its = [i for i in orig_sale.get("items", []) if i["product_id"] == pid]
+        qty = sum(i["qty"] for i in its)
+        if not qty: return 0.0, None
+        line_net = sum(i["qty"] * i["price"] - (i.get("discount") or 0) for i in its)
+        raw_all = sum(i["qty"] * i["price"] - (i.get("discount") or 0) for i in orig_sale.get("items", []))
+        factor = 1.0
+        if raw_all > 0 and (orig_sale.get("discount") or 0) > 0:
+            factor = max(0.0, (raw_all - float(orig_sale["discount"])) / raw_all)
+        unit = round(line_net * factor / qty, 4)
+        costed = [i for i in its if i.get("cost_price") is not None]
+        cq = sum(i["qty"] for i in costed)
+        cost = round(sum(i["cost_price"] * i["qty"] for i in costed) / cq, 4) if cq else None
+        return unit, cost
+
+    @staticmethod
+    def returned_qty(c, sale_id, pid):
+        """الكمية المُرجَعة سابقًا من هذه الفاتورة لهذا المنتج (مردود عادي أو استرداد كفالة)."""
+        return c.execute(
+            "SELECT COALESCE(SUM(ri.qty),0) FROM sales r JOIN sale_items ri ON ri.sale_id=r.id "
+            "WHERE r.status='مردود' AND r.notes LIKE ? AND ri.product_id=?",
+            (f"مردود من فاتورة #{sale_id} -%", pid)).fetchone()[0]
+
     @staticmethod
     def create_item(c, sid, product_id, qty, price, discount=0, cost_price=None):
         c.execute("INSERT INTO sale_items(sale_id,product_id,qty,price,discount,cost_price) VALUES(?,?,?,?,?,?)",
@@ -1659,6 +1689,57 @@ class ReportsDAO(BaseDAO):
 # ══════════════════════════════════════════════
 #  API
 # ══════════════════════════════════════════════
+def _sale_return_core(c, orig_sale, sid, items, notes, date):
+    """ينشئ فاتورة مردود لفاتورة بيع أصلية واحدة (دون commit). يعيد (ret_id, None) أو (None, (status, payload))."""
+    # دمج الأصناف المكرّرة، والتحقق من الكمية (عدد صحيح ≥ 1) ومن المتبقي القابل للإرجاع (المباع − المُرجَع سابقًا)
+    merged = {}
+    for i in items:
+        try: q = int(i.get("qty") or 0)
+        except (TypeError, ValueError): q = 0
+        if q < 1 or q != float(i.get("qty") or 0):
+            return None, (400, {"detail":"الكمية يجب أن تكون عددًا صحيحًا لا يقل عن 1"})
+        m = merged.setdefault(i["product_id"], {"product_id": i["product_id"], "qty": 0, "serials": []})
+        m["qty"] += q
+        m["serials"] += [str(x).strip() for x in i.get("serials", []) if str(x).strip()]
+    items = list(merged.values())
+    orig_items_map = {}
+    for oi in orig_sale.get("items", []):
+        orig_items_map[oi["product_id"]] = orig_items_map.get(oi["product_id"], 0) + oi["qty"]
+    for i in items:
+        sold_qty = orig_items_map.get(i["product_id"], 0)
+        left = sold_qty - SalesDAO.returned_qty(c, sid, i["product_id"])
+        if i["qty"] > left:
+            return None, (400, {"detail": f"الكمية المُرجَعة أكبر من المتبقي القابل للإرجاع ({max(0,left)}) للمنتج #{i['product_id']}"})
+
+    # التحقق من السيريالات: يجب أن تكون "مباعة" ومرتبطة بهذه الفاتورة تحديداً (وليس أي فاتورة أخرى)
+    for i in items:
+        prod = ProductsDAO.get_by_id(c, i["product_id"])
+        if prod and prod.get("track_serial"):
+            given = i["serials"]
+            if len(given) != i["qty"] or len(set(given)) != len(given):
+                return None, (400, {"detail": f"يجب تحديد {i['qty']} سيريال مختلفًا للمنتج {prod['name']}"})
+            for sn in given:
+                unit = ProductUnitsDAO.get_by_serial(c, sn)
+                if not unit or str(unit.get("product_id")) != str(i["product_id"]):
+                    return None, (400, {"detail": f"السيريال {sn} لا يتبع هذا المنتج"})
+                if unit.get("status") != "sold" or str(unit.get("sale_id")) != str(sid):
+                    return None, (400, {"detail": f"السيريال {sn} غير مرتبط بهذه الفاتورة أو غير قابل للإرجاع"})
+
+    # السعر والتكلفة من الفاتورة الأصلية (صافي الخصومات) وليس من المتصفح
+    vals = {i["product_id"]: SalesDAO.return_unit_values(orig_sale, i["product_id"]) for i in items}
+    total = round(sum(i["qty"] * vals[i["product_id"]][0] for i in items), 2)
+    cust_id = orig_sale.get("customer_id")
+    ret_id = SalesDAO.create(c, cust_id, date, "مردود", "إرجاع", f"مردود من فاتورة #{sid} - {notes}", -total, 0)
+    for i in items:
+        unit_price, unit_cost = vals[i["product_id"]]
+        SalesDAO.create_item(c, ret_id, i["product_id"], i["qty"], unit_price, 0, unit_cost)
+        ProductsDAO.update_stock(c, i["product_id"], i["qty"])  # إعادة للمخزون (عكس اتجاه البيع)
+        prod = ProductsDAO.get_by_id(c, i["product_id"])
+        if prod and prod.get("track_serial"):
+            for sn in i["serials"]:
+                ProductUnitsDAO.mark_in_stock_by_serial(c, sn)
+    return ret_id, None
+
 def handle_api(method, path, body, req):
     parsed = urlparse(path)
     parts  = parsed.path.strip("/").split("/")
@@ -2131,7 +2212,7 @@ def handle_api(method, path, body, req):
             return v
 
         if kind == "sale_item":
-            if not user_can_page(u, "pos"):
+            if not user_can_sales(u):
                 c.close(); return 403, {"detail": "غير مصرح — لا تملك صلاحية تعديل المبيعات"}
             it = BaseDAO.row1(c.execute("SELECT * FROM sale_items WHERE id=?", (rid,)))
             if not it: c.close(); return 404, {"detail": "البند غير موجود"}
@@ -2826,7 +2907,7 @@ def handle_api(method, path, body, req):
     # ── SALE RETURN (مردود مبيعات من الزبون) ──
     # ── كفالة المنتجات: قائمة المطالبات ──
     if ep == "warranty_claims" and method == "GET" and len(parts) == 2:
-        if not (user_can_page(u, "pos") or user_can_page(u, "warehouse")):
+        if not (user_can_sales(u) or user_can_page(u, "warehouse")):
             c.close(); return 403, {"detail": "غير مصرح"}
         rows = BaseDAO.rows(c.execute(
             "SELECT w.*, p.name AS product_name, cu.name AS customer_name FROM warranty_claims w "
@@ -2836,7 +2917,7 @@ def handle_api(method, path, body, req):
 
     # ── كفالة المنتجات: تغيير حالة المعيب (مرسل للمورد / عاد للمخزون / مشطوب) ──
     if ep == "warranty_claims" and method == "PUT" and len(parts) == 3:
-        if not user_can_page(u, "pos"):
+        if not user_can_sales(u):
             c.close(); return 403, {"detail": "غير مصرح"}
         cid = int(parts[2]); new_status = body.get("status", "")
         if new_status not in ("معيب عندنا", "مرسل للمورد", "عاد للمخزون", "مشطوب"):
@@ -2857,7 +2938,7 @@ def handle_api(method, path, body, req):
 
     # ── مردود كفالة: القطعة معيبة ولا تعود للمخزون؛ إما استبدال بقطعة سليمة أو استرداد المبلغ ──
     if ep == "warranty_return" and method == "POST":
-        if not user_can_page(u, "pos"):
+        if not user_can_sales(u):
             c.close(); return 403, {"detail": "غير مصرح — لا تملك صلاحية المبيعات"}
         sid = body.get("sale_id"); items = body.get("items", []) or []
         resolution = body.get("resolution", "replace")
@@ -2875,10 +2956,7 @@ def handle_api(method, path, body, req):
         for i in items:
             pid, qty = i.get("product_id"), int(i.get("qty") or 0)
             if qty < 1: c.close(); return 400, {"detail": "الكمية يجب أن تكون 1 على الأقل"}
-            returned = c.execute(
-                "SELECT COALESCE(SUM(ri.qty),0) FROM sales r JOIN sale_items ri ON ri.sale_id=r.id "
-                "WHERE r.status='مردود' AND r.notes LIKE ? AND ri.product_id=?",
-                (f"مردود من فاتورة #{sid} -%", pid)).fetchone()[0]
+            returned = SalesDAO.returned_qty(c, sid, pid)
             if qty > sold.get(pid, 0) - returned:
                 c.close(); return 400, {"detail": f"الكمية أكبر من المتبقي بالفاتورة للمنتج #{pid}"}
             prod = ProductsDAO.get_by_id(c, pid) or {}
@@ -2902,7 +2980,7 @@ def handle_api(method, path, body, req):
 
         refund_id = None
         if resolution == "refund":
-            total = sum(int(i["qty"]) * float(next((oi["price"] for oi in orig["items"] if oi["product_id"] == i["product_id"]), 0)) for i in items)
+            total = round(sum(int(i["qty"]) * SalesDAO.return_unit_values(orig, i["product_id"])[0] for i in items), 2)
             refund_id = SalesDAO.create(c, orig.get("customer_id"), date, "مردود", "إرجاع",
                                         f"مردود من فاتورة #{sid} - كفالة: {reason}", -total, 0)
         claim_ids = []
@@ -2916,8 +2994,8 @@ def handle_api(method, path, body, req):
                 for sn in rep: ProductUnitsDAO.mark_sold_by_serial(c, sn, pid, sid)   # البديلة تُربط بنفس الفاتورة
                 if not prod.get("track_serial"): ProductsDAO.update_stock(c, pid, -qty)  # خرجت قطعة سليمة للزبون
             else:
-                price = next((oi["price"] for oi in orig["items"] if oi["product_id"] == pid), 0)
-                SalesDAO.create_item(c, refund_id, pid, qty, price, 0, None)            # بلا إعادة للمخزون: القطعة معيبة
+                price, ucost = SalesDAO.return_unit_values(orig, pid)
+                SalesDAO.create_item(c, refund_id, pid, qty, price, 0, ucost)           # بلا إعادة للمخزون: القطعة معيبة
             cur = c.execute(
                 "INSERT INTO warranty_claims(sale_id,customer_id,product_id,qty,serials,replacement_serials,resolution,refund_sale_id,reason,status,date) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -2939,43 +3017,82 @@ def handle_api(method, path, body, req):
         if not orig_sale:
             c.close(); return 404, {"detail":"الفاتورة الأصلية غير موجودة"}
 
-        # التحقق: كمية كل صنف مُرجَع لا تتجاوز الكمية المباعة أصلاً بنفس الفاتورة
-        orig_items_map = {}
-        for oi in orig_sale.get("items", []):
-            orig_items_map[oi["product_id"]] = orig_items_map.get(oi["product_id"], 0) + oi["qty"]
-        for i in items:
-            sold_qty = orig_items_map.get(i["product_id"], 0)
-            if i["qty"] > sold_qty:
-                c.close(); return 400, {"detail": f"الكمية المُرجَعة أكبر من الكمية المباعة أصلاً للمنتج #{i['product_id']}"}
+        if orig_sale.get("status") == "مردود" or (orig_sale.get("total") or 0) < 0:
+            c.close(); return 400, {"detail":"هذه فاتورة مردود ولا يمكن إرجاعها"}
 
-        # التحقق من السيريالات: يجب أن تكون "مباعة" ومرتبطة بهذه الفاتورة تحديداً (وليس أي فاتورة أخرى)
-        for i in items:
-            prod = ProductsDAO.get_by_id(c, i["product_id"])
-            if prod and prod.get("track_serial"):
-                given = [str(s).strip() for s in i.get("serials", []) if str(s).strip()]
-                if len(given) != i["qty"]:
-                    c.close(); return 400, {"detail": f"يجب تحديد {i['qty']} سيريال للمنتج {prod['name']}"}
-                for s in given:
-                    unit = ProductUnitsDAO.get_by_serial(c, s)
-                    if not unit or str(unit.get("product_id")) != str(i["product_id"]):
-                        c.close(); return 400, {"detail": f"السيريال {s} لا يتبع هذا المنتج"}
-                    if unit.get("status") != "sold" or str(unit.get("sale_id")) != str(sid):
-                        c.close(); return 400, {"detail": f"السيريال {s} غير مرتبط بهذه الفاتورة أو غير قابل للإرجاع"}
-
-        total = sum(i["qty"] * i["price"] for i in items)
-        cust_id = orig_sale.get("customer_id")
-        ret_id = SalesDAO.create(c, cust_id, date, "مردود", "إرجاع", f"مردود من فاتورة #{sid} - {notes}", -total, 0)
-        for i in items:
-            SalesDAO.create_item(c, ret_id, i["product_id"], i["qty"], i["price"], 0, None)
-            ProductsDAO.update_stock(c, i["product_id"], i["qty"])  # إعادة للمخزون (عكس اتجاه البيع)
-            prod = ProductsDAO.get_by_id(c, i["product_id"])
-            if prod and prod.get("track_serial"):
-                given = [str(s).strip() for s in i.get("serials", []) if str(s).strip()]
-                for s in given:
-                    ProductUnitsDAO.mark_in_stock_by_serial(c, s)
+        ret_id, err = _sale_return_core(c, orig_sale, sid, items, notes, date)
+        if err:
+            c.rollback(); c.close(); return err
         c.commit()
         ret = SalesDAO.get_by_id(c, ret_id)
         c.close(); return 201, ret
+
+    # ── مردود أصناف: اختيار الأصناف والكميات لزبون دون تحديد فاتورة؛ تُوزَّع على فواتيره الأحدث فالأقدم ──
+    if ep == "sale_return_items" and method == "POST":
+        if not user_can_sales(u):
+            c.close(); return 403, {"detail": "غير مصرح — لا تملك صلاحية المبيعات"}
+        cust  = body.get("customer_id")
+        items = body.get("items", []) or []
+        notes = body.get("notes", ""); date = body.get("date", "")
+        if not items:
+            c.close(); return 400, {"detail": "يجب تحديد صنف واحد على الأقل للإرجاع"}
+        general = cust in (None, "", 0, "0")
+        cond, cparams = (("(s.customer_id IS NULL OR s.customer_id='' OR CAST(s.customer_id AS INTEGER)=0)", [])
+                         if general else ("CAST(s.customer_id AS INTEGER)=?", [int(cust)]))
+        # دمج الأصناف المكررة
+        want = {}
+        for i in items:
+            try: q = int(i.get("qty") or 0)
+            except (TypeError, ValueError): q = 0
+            if q < 1 or q != float(i.get("qty") or 0):
+                c.close(); return 400, {"detail": "الكمية يجب أن تكون عددًا صحيحًا لا يقل عن 1"}
+            w = want.setdefault(i["product_id"], {"qty": 0, "serials": []})
+            w["qty"] += q
+            w["serials"] += [str(x).strip() for x in i.get("serials", []) if str(x).strip()]
+        per_sale = {}      # sale_id -> {product_id: {"qty":n, "serials":[...]}}
+        for pid, w in want.items():
+            prod = ProductsDAO.get_by_id(c, pid) or {}
+            pname = prod.get("name", f"#{pid}")
+            if prod.get("track_serial"):
+                if len(w["serials"]) != w["qty"] or len(set(w["serials"])) != w["qty"]:
+                    c.close(); return 400, {"detail": f"يجب تحديد {w['qty']} سيريال مختلفًا للمنتج {pname}"}
+                for sn in w["serials"]:
+                    unit = ProductUnitsDAO.get_by_serial(c, sn)
+                    if not unit or str(unit.get("product_id")) != str(pid) or unit.get("status") != "sold" or not unit.get("sale_id"):
+                        c.close(); return 400, {"detail": f"السيريال {sn} غير مباع أو لا يتبع المنتج {pname}"}
+                    ok = c.execute(f"SELECT 1 FROM sales s WHERE s.id=? AND {cond} AND s.total>=0 AND COALESCE(s.status,'')<>'مردود'",
+                                   [unit["sale_id"]] + cparams).fetchone()
+                    if not ok:
+                        c.close(); return 400, {"detail": f"السيريال {sn} لا يتبع مبيعات هذا الزبون"}
+                    e = per_sale.setdefault(unit["sale_id"], {}).setdefault(pid, {"qty": 0, "serials": []})
+                    e["qty"] += 1; e["serials"].append(sn)
+            else:
+                rows = c.execute(
+                    f"SELECT s.id, SUM(si.qty) FROM sales s JOIN sale_items si ON si.sale_id=s.id "
+                    f"WHERE si.product_id=? AND s.total>=0 AND COALESCE(s.status,'')<>'مردود' AND {cond} "
+                    f"GROUP BY s.id ORDER BY s.date DESC, s.id DESC", [pid] + cparams).fetchall()
+                remaining, available = w["qty"], 0
+                for sale_id, sold in rows:
+                    left = max(0, sold - SalesDAO.returned_qty(c, sale_id, pid))
+                    available += left
+                    take = min(left, remaining)
+                    if take > 0:
+                        e = per_sale.setdefault(sale_id, {}).setdefault(pid, {"qty": 0, "serials": []})
+                        e["qty"] += take; remaining -= take
+                if remaining > 0:
+                    c.close(); return 400, {"detail": f"الكمية المطلوبة من {pname} أكبر من المتاح للإرجاع لدى هذا الزبون ({available})"}
+        ret_ids = []
+        for sale_id in sorted(per_sale.keys(), reverse=True):
+            orig = SalesDAO.get_by_id(c, sale_id)
+            its = [{"product_id": pid, "qty": e["qty"], "serials": e["serials"]} for pid, e in per_sale[sale_id].items()]
+            ret_id, err = _sale_return_core(c, orig, sale_id, its, notes, date)
+            if err:
+                c.rollback(); c.close(); return err          # كل شيء أو لا شيء
+            ret_ids.append(ret_id)
+        c.commit()
+        rets = [SalesDAO.get_by_id(c, r) for r in ret_ids]
+        c.close()
+        return 201, {"return_ids": ret_ids, "count": len(ret_ids), "total": round(sum(abs(r["total"]) for r in rets), 2), "returns": rets}
 
     c.close()
     return 404,{"detail":"not found"}
@@ -3447,6 +3564,7 @@ const NAV=[
   {id:'warehouse',label:'المخازن',ic:'M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2zM9 22V12h6v10'},
   {id:'purchases',label:'المشتريات',ic:'M1 3h15v13H1zM16 8h4l3 3v5h-7V8z'},
   {id:'pos',label:'نقطة البيع',ic:'M6 2H3L1 1M23 6H6l2.68 13.39a2 2 0 002 1.61h9.72a2 2 0 002-1.61L23 6z'},
+  {id:'sales',label:'المبيعات',ic:'M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8zM14 2v6h6M16 13H8M16 17H8M10 9H8'},
   {id:'suppliers',label:'الموردون',ic:'M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2M9 7a4 4 0 100 8 4 4 0 000-8z'},
   {id:'customers',label:'الزبائن',ic:'M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2M12 7a4 4 0 100 8 4 4 0 000-8z'},
   {id:'accounting',label:'الحسابات',ic:'M12 1v22M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6'},
@@ -3467,10 +3585,10 @@ function appHTML(){
   const role = USER?.role||'user';
   // الصفحات المسموح بها لهذا المستخدم (مخصصة إن وُجدت، وإلا افتراضية حسب الدور)
   const allowed = USER?.permissions?.pages || (role==='admin'
-    ? ['dashboard','products','warehouse','purchases','pos','suppliers','customers','accounting','expenses','services','quotes','reports','settings']
+    ? ['dashboard','products','warehouse','purchases','pos','sales','suppliers','customers','accounting','expenses','services','quotes','reports','settings']
     : role==='cashier'
     ? ['pos','products','quotes']
-    : ['dashboard','products','warehouse','purchases','pos','suppliers','customers','accounting','expenses','services','quotes','reports']);
+    : ['dashboard','products','warehouse','purchases','pos','sales','suppliers','customers','accounting','expenses','services','quotes','reports']);
   const visibleNav = NAV.filter(n=>allowed.includes(n.id));
   // إعادة توجيه إذا الصفحة الحالية غير مسموح بها
   if(!allowed.includes(page)) page = allowed[0];
@@ -3519,6 +3637,7 @@ function pageHTML(){
   if(page==='warehouse')  return warehouseHTML();
   if(page==='purchases')  return purchasesHTML();
   if(page==='pos')        return posHTML();
+  if(page==='sales')      return salesPageHTML();
   if(page==='suppliers')  return entityHTML('suppliers','الموردون','ادارة الموردين والارصدة');
   if(page==='customers')  return entityHTML('customers','الزبائن','ادارة الزبائن والارصدة');
   if(page==='accounting') return accountingHTML();
@@ -5455,10 +5574,11 @@ window.renderSalesReport = function(){
   // وإلا نرجع لسعر الشراء الحالي كأفضل تقدير متاح (فواتير قديمة قبل تفعيل هذا التسجيل)
   const withMargin = list.map(s=>{
     let cost = 0;
+    const retSign = (s.status==='مردود' || (s.total||0)<0) ? -1 : 1;   // المردود يُرجع التكلفة كما يُرجع الإيراد
     (s.items||[]).forEach(it=>{
       const prod = products.find(p=>p.id===it.product_id);
       const unitCost = (it.cost_price!=null) ? it.cost_price : (prod ? prod.buy_price : 0);
-      cost += unitCost * (it.qty||0);
+      cost += retSign * unitCost * (it.qty||0);
     });
     const revenue = s.total||0;
     const profit  = revenue - cost;
@@ -5629,7 +5749,7 @@ window.renderDetailedReport = function(){
         const prod = products.find(p=>p.id===item.product_id);
         const buyPrice = (item.cost_price!=null) ? item.cost_price : (prod ? (prod.buy_price||0) : 0);
         const sellPrice = item.price||0;
-        const qty = item.qty||0;
+        const qty = (item.qty||0) * (isReturnInv ? -1 : 1);     // المردود بالسالب فلا يُحسب كبيع
         rows.push({
           date: s.date, kind:'sale', id:item.id, ref: '#'+s.id, party: custName,
           desc: item.product_name || prod?.name || ('منتج #'+item.product_id),
@@ -6684,6 +6804,7 @@ function modalHTML(){
   if(MS.type==='retpur')   return returnPurModal(MS.data||{});
   if(MS.type==='returnsale') return returnSaleModal(MS.data||{});
   if(MS.type==='warrantysale') return warrantySaleModal(MS.data||{});
+  if(MS.type==='returnitems') return returnItemsModal(MS.data||{});
   if(MS.type==='warrantyclaims') return warrantyClaimsModal(MS.data||{});
   if(MS?.type==='payform') return payModal(MS.data||{});
   if(MS?.type==='payhist') return payHistModal(MS.data||{});
@@ -7936,6 +8057,85 @@ function returnPurModal(p){
   </div></div>`;
 }
 
+// ── مردود أصناف: اختيار الزبون ثم الأصناف والكميات دون تحديد فاتورة (يُوزَّع على فواتيره الأحدث فالأقدم) ──
+window.returnItems = function(){ MS = {type:'returnitems', data:{customer:''}}; render(); };
+window.riSetCust = function(v){ MS.data = {customer: v}; render(); };
+window.riFilter = function(q){
+  q = (q||'').trim().toLowerCase();
+  document.querySelectorAll('.ri-row').forEach(r=>{ r.style.display = (!q || (r.dataset.name||'').toLowerCase().includes(q)) ? '' : 'none'; });
+};
+// الأصناف القابلة للإرجاع لزبون: المباع − المُرجَع سابقًا (مردود عادي أو كفالة) من كل فواتيره
+function returnableForCustomer(custId){
+  const cid = custId ? parseInt(custId) : 0;
+  const returned = {};
+  sales.forEach(r=>{
+    if(!salesIsReturn(r)) return;
+    const o = salesOrigOf(r); if(!o) return;
+    (r.items||[]).forEach(i=>{ const k=o+':'+i.product_id; returned[k]=(returned[k]||0)+i.qty; });
+  });
+  const byProd = {};
+  sales.forEach(sl=>{
+    if(salesIsReturn(sl)) return;
+    if((sl.customer_id ? parseInt(sl.customer_id) : 0) !== cid) return;
+    const per = {};
+    (sl.items||[]).forEach(i=>{
+      const e = per[i.product_id] = per[i.product_id] || {qty:0, serials:[], name:i.product_name};
+      e.qty += i.qty;
+      if(i.serials_str) e.serials.push(...String(i.serials_str).split(',').map(x=>x.trim()).filter(Boolean));
+    });
+    Object.keys(per).forEach(pid=>{
+      const left = per[pid].qty - (returned[sl.id+':'+pid]||0);
+      if(left<=0) return;
+      const b = byProd[pid] = byProd[pid] || {product_id:parseInt(pid), name:per[pid].name, left:0, serials:[], invoices:[], track:false};
+      b.left += left; b.invoices.push('#'+sl.id); b.serials.push(...per[pid].serials);
+      const prod = products.find(x=>x.id===parseInt(pid)); b.track = !!(prod && prod.track_serial);
+    });
+  });
+  return Object.values(byProd).sort((a,b)=>a.name.localeCompare(b.name));
+}
+
+function returnItemsModal(d){
+  const cust = d.customer||'';
+  const rows = returnableForCustomer(cust);
+  return `<div class="overlay" id="mover"><div class="modal" style="max-width:720px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+    <div style="font-size:16px;font-weight:700;color:#fbbf24;">↩️ مردود مبيعات — أصناف</div>
+    <button class="btn s" style="padding:4px 9px;" id="mc">✕</button>
+  </div>
+  <div id="merr"></div>
+  <div class="g2" style="margin-bottom:12px;">
+    <div><label class="lbl">الزبون</label>
+      <select class="inp" id="ri-cust" onchange="riSetCust(this.value)">
+        <option value="" ${!cust?'selected':''}>زبون عام</option>
+        ${customers.map(c=>`<option value="${c.id}" ${String(c.id)===String(cust)?'selected':''}>${esc(c.name)}</option>`).join('')}
+      </select></div>
+    <div><label class="lbl">تاريخ المردود</label><input class="inp" type="date" id="ri-date" value="${new Date().toISOString().slice(0,10)}"/></div>
+  </div>
+  <div style="margin-bottom:12px;"><label class="lbl">السبب / ملاحظات</label><input class="inp" id="ri-notes" placeholder="مثال: غير مناسب / خطأ في الطلب..."/></div>
+  <div style="font-size:13px;font-weight:700;color:#f1f5f9;margin-bottom:8px;">الأصناف المباعة لهذا الزبون (حدد ما سيُرجَع):</div>
+  <input class="inp" placeholder="🔍 بحث عن صنف..." oninput="riFilter(this.value)" style="margin-bottom:10px;"/>
+  <div class="card" style="padding:10px;margin-bottom:14px;max-height:340px;overflow-y:auto;">
+    ${rows.map(r=>`<div class="ri-row" data-name="${esc(r.name)}" style="padding:10px 0;border-bottom:1px solid #1e2537;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+        <div><div style="font-weight:700;color:#f1f5f9;">${esc(r.name)}</div>
+          <div style="font-size:11px;color:#64748b;">متاح للإرجاع: ${r.left} — من الفواتير ${r.invoices.join('، ')}</div></div>
+        ${r.track ? '' : `<input class="inp ri-qty" data-product="${r.product_id}" type="number" min="0" max="${r.left}" value="0" style="width:90px;padding:5px 8px;"/>`}
+      </div>
+      ${r.track ? `<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;">
+        ${r.serials.map(sn=>`<label style="display:flex;align-items:center;gap:5px;background:#161923;border:1px solid #2d3349;border-radius:6px;padding:5px 10px;cursor:pointer;font-size:12px;font-family:monospace;color:#cbd5e1;">
+          <input type="checkbox" class="ri-serial" data-product="${r.product_id}" data-serial="${esc(sn)}" style="width:14px;height:14px;"/>${esc(sn)}</label>`).join('')
+          || '<span style="font-size:12px;color:#f87171;">لا توجد سيريالات مباعة مسجلة</span>'}
+      </div>` : ''}
+    </div>`).join('') || '<div style="text-align:center;color:#64748b;padding:24px;">لا توجد أصناف قابلة للإرجاع لهذا الزبون</div>'}
+  </div>
+  <div style="font-size:12px;color:#64748b;margin-bottom:12px;">يُحتسب سعر كل صنف من فاتورته الأصلية (صافي الخصم)، وتُنشأ فاتورة مردود مرتبطة بكل فاتورة أصلية تُرجَع منها.</div>
+  <div style="display:flex;gap:10px;">
+    <button class="btn p" style="background:linear-gradient(135deg,#b45309,#92400e);" id="ms">↩️ تأكيد المردود</button>
+    <button class="btn s" id="mc2">إلغاء</button>
+  </div>
+  </div></div>`;
+}
+
 // ── مردود كفالة: قطعة معيبة من فاتورة بيع → استبدال بسليمة أو استرداد المبلغ (المعيبة لا تعود للمخزون) ──
 window.warrantySale = function(id){
   const s = sales.find(x=>x.id===id);
@@ -8022,7 +8222,8 @@ window.warrantyClaimStatus = async function(id, status){
   const msg = status==='عاد للمخزون' ? 'ستعود القطعة (أو الكمية) إلى المخزون كسليمة. متابعة؟'
             : status==='مشطوب' ? 'ستُشطب القطعة نهائيًا ولن تعود للمخزون. متابعة؟' : 'تغيير الحالة إلى: '+status+'؟';
   if(!confirm(msg)) return;
-  try{ await api('PUT','/api/warranty_claims/'+id, {status}); await loadAll(); await openWarrantyClaims(); }
+  try{ await api('PUT','/api/warranty_claims/'+id, {status}); await loadAll();
+       if(page==='sales') await salesLoadClaims(); else await openWarrantyClaims(); }
   catch(e){ alert('خطأ: '+e.message); }
 };
 function warrantyClaimsModal(d){
@@ -9358,7 +9559,7 @@ function bindModal(){
           items
         });
         await loadAll();
-        MS={type:'saleslist'}; render();
+        MS = (page==='sales') ? null : {type:'saleslist'}; render();
       }catch(e){
         errEl.innerHTML='<div class="err">خطأ: '+e.message+'</div>';
       }
@@ -9439,6 +9640,33 @@ function bindModal(){
     };
   }
 
+  // ── مردود أصناف (دون تحديد فاتورة) ──
+  if(MS?.type==='returnitems'){
+    document.getElementById('ms').onclick=async()=>{
+      const errEl = document.getElementById('merr');
+      const map = {};
+      document.querySelectorAll('.ri-qty').forEach(inp=>{
+        const qty = parseInt(inp.value)||0;
+        if(qty>0){ const pid = parseInt(inp.dataset.product); map[pid] = {product_id:pid, qty, serials:[]}; }
+      });
+      document.querySelectorAll('.ri-serial:checked').forEach(cb=>{
+        const pid = parseInt(cb.dataset.product);
+        if(!map[pid]) map[pid] = {product_id:pid, qty:0, serials:[]};
+        map[pid].qty += 1; map[pid].serials.push(cb.dataset.serial);
+      });
+      const itemsArr = Object.values(map);
+      if(!itemsArr.length){ errEl.innerHTML = '<div class="err">حدد صنفًا واحدًا على الأقل وكمية أكبر من صفر</div>'; return; }
+      try{
+        const r = await api('POST','/api/sale_return_items', {
+          customer_id: document.getElementById('ri-cust').value || null,
+          date: document.getElementById('ri-date').value || new Date().toISOString().slice(0,10),
+          notes: document.getElementById('ri-notes').value || '', items: itemsArr});
+        await loadAll(); closeM();
+        alert('✅ تم تسجيل المردود ('+r.count+' فاتورة مردود) بقيمة '+(r.total||0).toLocaleString()+' '+cur());
+      }catch(e){ errEl.innerHTML = '<div class="err">'+e.message+'</div>'; }
+    };
+  }
+
   // ── مردود كفالة ──
   if(MS?.type==='warrantysale'){
     document.getElementById('ms').onclick=async()=>{
@@ -9466,6 +9694,7 @@ function bindModal(){
       try{
         const r = await api('POST','/api/warranty_return', {sale_id: sale.id, date, notes, resolution, items: itemsArr});
         await loadAll(); closeM();
+        window._salesClaims = null; if(page==='sales' && window._salesTab==='claims') setTimeout(salesLoadClaims,0);
         alert(resolution==='replace' ? '✅ تم تسجيل الاستبدال. القطعة المعيبة محفوظة في مطالبات الكفالة (صفحة المخازن).'
                                      : '✅ تم استرداد المبلغ وتسجيل القطعة المعيبة في مطالبات الكفالة.');
       }catch(e){ errEl.innerHTML = '<div class="err">'+e.message+'</div>'; }
@@ -10510,6 +10739,170 @@ window.openUnitPicker = async function(p){
 //  سجل المبيعات + تعديل الفاتورة
 // ══════════════════════════════════════════════
 
+// ══════════════════════════════════════════════
+//  صفحة المبيعات (منفصلة عن نقطة البيع): الفواتير + مردود المبيعات + الكفالة
+// ══════════════════════════════════════════════
+window._salesTab = window._salesTab || 'invoices';
+window._salesF   = window._salesF   || {from:'', to:'', q:'', status:''};
+window._salesClaims = (window._salesClaims === undefined) ? null : window._salesClaims;
+
+function salesCustName(s){
+  return s.customer_id ? (customers.find(c=>c.id===parseInt(s.customer_id))?.name||'—') : 'زبون عام';
+}
+function salesIsReturn(s){ return s.status==='مردود' || (s.total||0)<0; }
+function salesOrigOf(s){ const m=(s.notes||'').match(/فاتورة #(\d+)/); return m?parseInt(m[1]):null; }
+function salesReasonOf(s){ const parts=(s.notes||'').split(' - '); return parts.slice(1).join(' - '); }
+
+function salesFiltered(){
+  const f = window._salesF, q = (f.q||'').trim().toLowerCase();
+  return sales.filter(s=>{
+    if(f.from && (s.date||'') < f.from) return false;
+    if(f.to   && (s.date||'') > f.to)   return false;
+    if(f.status && s.status !== f.status) return false;
+    if(q){
+      const hay = ('#'+s.id+' '+s.id+' '+salesCustName(s)+' '+(s.notes||'')).toLowerCase();
+      if(!hay.includes(q)) return false;
+    }
+    return true;
+  }).sort((a,b)=> (b.date||'').localeCompare(a.date||'') || b.id-a.id);
+}
+
+function salesPageHTML(){
+  const tab = window._salesTab, f = window._salesF;
+  const tabs = [['invoices','🧾 الفواتير'],['returns','↩️ مردودات المبيعات'],['claims','🛡️ مطالبات الكفالة']];
+  const showFilters = tab!=='claims';
+  if(tab==='claims' && window._salesClaims===null && !window._salesClaimsLoading) setTimeout(salesLoadClaims,0);   // تحميل تلقائي
+  return `<div class="ti">المبيعات</div><div class="sub">سجل فواتير البيع، مردود المبيعات، وإرجاع الكفالة</div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px;">
+    ${tabs.map(t=>`<button class="btn ${tab===t[0]?'p':'s'}" onclick="salesTab('${t[0]}')">${t[1]}</button>`).join('')}
+    <span style="flex:1"></span>
+    <button class="btn p" style="background:linear-gradient(135deg,#b45309,#92400e);" onclick="returnItems()">↩️ مردود أصناف</button>
+    <button class="btn s" onclick="page='pos';render();">🛒 فاتورة جديدة (نقطة البيع)</button>
+  </div>
+  ${showFilters?`<div class="card" style="padding:12px;margin-bottom:14px;">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;">
+      <div><label class="lbl">بحث (رقم فاتورة / زبون / ملاحظات)</label>
+        <input class="inp" id="sp-q" value="${esc(f.q)}" placeholder="بحث..." oninput="salesSetF('q',this.value)"/></div>
+      <div><label class="lbl">من تاريخ</label><input class="inp" type="date" value="${f.from}" onchange="salesSetF('from',this.value)"/></div>
+      <div><label class="lbl">إلى تاريخ</label><input class="inp" type="date" value="${f.to}" onchange="salesSetF('to',this.value)"/></div>
+      ${tab==='invoices'?`<div><label class="lbl">الحالة</label>
+        <select class="inp" onchange="salesSetF('status',this.value)">
+          ${[['','الكل'],['معلق','معلق'],['مدفوع جزئياً','مدفوع جزئياً'],['مدفوع','مدفوع'],['مردود','مردود']].map(o=>`<option value="${o[0]}" ${f.status===o[0]?'selected':''}>${o[1]}</option>`).join('')}
+        </select></div>`:''}
+    </div>
+  </div>`:''}
+  <div id="sales-page-body">${salesBodyHTML()}</div>`;
+}
+
+window.salesSetF = function(k,v){ window._salesF[k]=v; salesRenderBody(); };
+window.salesRenderBody = function(){ const el=document.getElementById('sales-page-body'); if(el) el.innerHTML = salesBodyHTML(); };
+window.salesTab = function(t){
+  window._salesTab = t;
+  if(t==='returns' && window._salesF.status==='مردود') window._salesF.status='';
+  render();
+  if(t==='claims') salesLoadClaims();
+};
+window.salesLoadClaims = async function(){
+  window._salesClaimsLoading = true; salesRenderBody();
+  try{ window._salesClaims = await api('GET','/api/warranty_claims'); window._salesClaimsError=''; }
+  catch(e){ window._salesClaimsError = e.message; window._salesClaims = []; }
+  window._salesClaimsLoading = false; salesRenderBody();
+};
+
+function salesBodyHTML(){
+  const tab = window._salesTab;
+  const f = v => (Math.round((v||0)*100)/100).toLocaleString();
+  if(tab==='claims') return salesClaimsHTML();
+  const list = salesFiltered();
+  if(tab==='returns'){
+    const rets = list.filter(salesIsReturn);
+    const sum = rets.reduce((t,s)=>t+Math.abs(s.total||0),0);
+    return `<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:14px;">
+      <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">عدد المردودات</div><div style="font-size:18px;font-weight:800;color:#fbbf24;margin-top:5px;">${rets.length}</div></div>
+      <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">إجمالي قيمة المردودات</div><div style="font-size:18px;font-weight:800;color:#f87171;margin-top:5px;">${f(sum)} ${cur()}</div></div>
+    </div>
+    ${printPdfToolbar('sales-page-print','مردودات المبيعات')}
+    <div id="sales-page-print" class="card" style="overflow-x:auto;"><table>
+      <thead><tr><th>#</th><th>التاريخ</th><th>الزبون</th><th>الفاتورة الأصلية</th><th>النوع</th><th>الأصناف</th><th>القيمة</th><th>السبب</th></tr></thead>
+      <tbody>${rets.map(s=>{
+        const orig = salesOrigOf(s), isWar = (s.notes||'').includes('كفالة:');
+        return `<tr><td style="color:#64748b;">#${s.id}</td><td>${s.date||'—'}</td>
+          <td style="color:#52b788;font-weight:600;">${esc(salesCustName(s))}</td>
+          <td>${orig?'#'+orig:'—'}</td>
+          <td><span class="badge ${isWar?'b':'y'}">${isWar?'🛡️ كفالة (استرداد)':'↩️ مردود عادي'}</span></td>
+          <td style="font-size:12px;color:#94a3b8;">${(s.items||[]).map(i=>esc((i.product_name||('#'+i.product_id))+' ×'+i.qty)).join('، ')||'—'}</td>
+          <td style="font-weight:700;color:#f87171;">${f(Math.abs(s.total||0))} ${cur()}</td>
+          <td style="font-size:12px;color:#94a3b8;">${esc(salesReasonOf(s)||'—')}</td></tr>`;
+      }).join('')||'<tr><td colspan="8" style="text-align:center;color:#64748b;padding:20px;">لا توجد مردودات</td></tr>'}</tbody>
+    </table></div>`;
+  }
+  // الفواتير
+  const inv  = list.filter(s=>!salesIsReturn(s));
+  const rets = list.filter(salesIsReturn);
+  const totalInv = inv.reduce((t,s)=>t+(s.total||0),0);
+  const totalRet = rets.reduce((t,s)=>t+Math.abs(s.total||0),0);
+  const remaining = inv.reduce((t,s)=>t+Math.max(0,(s.total||0)-(s.paid||0)),0);
+  return `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:14px;">
+      <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">عدد الفواتير</div><div style="font-size:18px;font-weight:800;color:#60a5fa;margin-top:5px;">${inv.length}</div></div>
+      <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">إجمالي المبيعات</div><div style="font-size:18px;font-weight:800;color:#52b788;margin-top:5px;">${f(totalInv)} ${cur()}</div></div>
+      <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">المردودات</div><div style="font-size:18px;font-weight:800;color:#f87171;margin-top:5px;">${f(totalRet)} ${cur()}</div></div>
+      <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">صافي المبيعات</div><div style="font-size:18px;font-weight:800;color:#fbbf24;margin-top:5px;">${f(totalInv-totalRet)} ${cur()}</div></div>
+      <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">المتبقي على الزبائن</div><div style="font-size:18px;font-weight:800;color:#f87171;margin-top:5px;">${f(remaining)} ${cur()}</div></div>
+    </div>
+    ${printPdfToolbar('sales-page-print','سجل المبيعات')}
+    <div id="sales-page-print" class="card" style="overflow-x:auto;"><table>
+      <thead><tr><th>#</th><th>التاريخ</th><th>الزبون</th><th>الإجمالي</th><th>المدفوع</th><th>المتبقي</th><th>الحالة</th><th>إجراءات</th></tr></thead>
+      <tbody>${list.map(s=>{
+        const isRet = salesIsReturn(s), paid = s.paid||0, rem = isRet ? 0 : Math.max(0,(s.total||0)-paid), orig = salesOrigOf(s);
+        return `<tr>
+          <td style="color:#64748b;">#${s.id}</td><td style="font-weight:600;">${s.date||'—'}</td>
+          <td style="color:#52b788;font-weight:600;">${esc(salesCustName(s))}</td>
+          <td style="font-weight:700;color:${isRet?'#fbbf24':'#f1f5f9'};">${f(s.total)} ${cur()}</td>
+          <td style="color:#52b788;">${isRet?'—':f(paid)+' '+cur()}</td>
+          <td style="color:${rem>0?'#f87171':'#52b788'};">${isRet?'—':f(rem)+' '+cur()}</td>
+          <td><span class="badge ${isRet?'y':s.status==='مدفوع'?'g':s.status==='مدفوع جزئياً'?'b':'y'}">${s.status}</span>${isRet&&orig?`<div style="font-size:11px;color:#64748b;">من فاتورة #${orig}</div>`:''}</td>
+          <td><div style="display:flex;gap:4px;flex-wrap:wrap;">
+            ${!isRet?`<button class="btn s" style="padding:3px 8px;font-size:11px;" onclick="openEditSale(${s.id})">✏️ تعديل</button>`:''}
+            ${!isRet?`<button class="btn p" style="padding:3px 8px;font-size:11px;background:linear-gradient(135deg,#1e40af,#1e3a8a);" onclick="openPay(${s.id},'sale')">💳 دفعة</button>`:''}
+            ${!isRet?`<button class="btn s" style="padding:3px 8px;font-size:11px;color:#fbbf24;border-color:#5c4a23;" onclick="returnSale(${s.id})">↩️ مردود</button>`:''}
+            ${!isRet?`<button class="btn s" style="padding:3px 8px;font-size:11px;color:#60a5fa;border-color:#1e3a5f;" onclick="warrantySale(${s.id})">🛡️ كفالة</button>`:''}
+            ${!isRet?`<button class="btn d" style="padding:3px 8px;font-size:11px;" onclick="deleteSale(${s.id})">🗑️</button>`:''}
+          </div></td></tr>`;
+      }).join('')||'<tr><td colspan="8" style="text-align:center;color:#64748b;padding:20px;">لا توجد فواتير مطابقة</td></tr>'}</tbody>
+    </table></div>`;
+}
+
+function salesClaimsHTML(){
+  if(window._salesClaims===null && !window._salesClaimsLoading)
+    return '<div style="text-align:center;color:#64748b;padding:30px;">جارٍ التحميل...</div>';
+  if(window._salesClaimsLoading) return '<div style="text-align:center;color:#64748b;padding:30px;">جارٍ التحميل...</div>';
+  const rows = window._salesClaims||[];
+  const badge = st => st==='معيب عندنا' ? 'r' : st==='مرسل للمورد' ? 'y' : st==='عاد للمخزون' ? 'g' : 'b';
+  const err = window._salesClaimsError ? `<div class="err">${esc(window._salesClaimsError)}</div>` : '';
+  const open = rows.filter(r=>r.status==='معيب عندنا'||r.status==='مرسل للمورد').length;
+  return err + `<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:14px;">
+      <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">إجمالي المطالبات</div><div style="font-size:18px;font-weight:800;color:#60a5fa;margin-top:5px;">${rows.length}</div></div>
+      <div class="stat" style="text-align:center;"><div style="font-size:12px;color:#64748b;">مفتوحة (معيبة لم تُغلق)</div><div style="font-size:18px;font-weight:800;color:#fbbf24;margin-top:5px;">${open}</div></div>
+    </div>`
+    + (!rows.length ? '<div class="card" style="padding:28px;text-align:center;color:#64748b;">لا توجد مطالبات كفالة. لإضافة واحدة اضغط «🛡️ كفالة» على فاتورة من تبويب الفواتير.</div>' : `
+    <div class="card" style="overflow-x:auto;"><table>
+      <thead><tr><th>التاريخ</th><th>الزبون</th><th>المنتج</th><th>الكمية / السيريال</th><th>المعالجة</th><th>العطل</th><th>الحالة</th><th>إجراءات</th></tr></thead>
+      <tbody>${rows.map(r=>`<tr>
+        <td>${r.date||'—'}</td>
+        <td>${esc(r.customer_name||'زبون عام')}<div style="font-size:11px;color:#64748b;">فاتورة #${r.sale_id}</div></td>
+        <td>${esc(r.product_name||('#'+r.product_id))}</td>
+        <td>${r.qty}${r.serials?`<div style="font-size:11px;font-family:monospace;color:#94a3b8;">${esc(r.serials)}${r.replacement_serials?' ← '+esc(r.replacement_serials):''}</div>`:''}</td>
+        <td>${r.resolution==='replace'?'🔁 استبدال':'💵 استرداد'}</td>
+        <td style="font-size:12px;color:#94a3b8;">${esc(r.reason||'—')}</td>
+        <td><span class="badge ${badge(r.status)}">${r.status}</span></td>
+        <td>${(r.status==='معيب عندنا'||r.status==='مرسل للمورد')?`<div style="display:flex;gap:4px;flex-wrap:wrap;">
+          ${r.status==='معيب عندنا'?`<button class="btn s" style="padding:3px 8px;font-size:11px;" onclick="warrantyClaimStatus(${r.id},'مرسل للمورد')">📦 للمورد</button>`:''}
+          <button class="btn s" style="padding:3px 8px;font-size:11px;color:#52b788;" onclick="warrantyClaimStatus(${r.id},'عاد للمخزون')">✅ عادت سليمة</button>
+          <button class="btn d" style="padding:3px 8px;font-size:11px;" onclick="warrantyClaimStatus(${r.id},'مشطوب')">🗑️ شطب</button>
+        </div>`:'—'}</td></tr>`).join('')}</tbody>
+    </table></div>`);
+}
+
 window.openSalesList = function(){
   MS={type:'saleslist'}; render();
 };
@@ -10558,7 +10951,7 @@ window.deleteSale = async function(id){
   try{
     await api('DELETE','/api/sales/'+id);
     await loadAll();
-    MS={type:'saleslist'}; render();
+    MS = (page==='sales') ? null : {type:'saleslist'}; render();
   }catch(e){ alert('خطأ: '+e.message); }
 };
 
@@ -10643,7 +11036,7 @@ function editSaleModal(s){
 
   <div style="display:flex;gap:10px;">
     <button class="btn p" id="ms" style="flex:1;justify-content:center;">💾 حفظ التعديلات</button>
-    <button class="btn s" onclick="MS={type:'saleslist'};render();">← رجوع للقائمة</button>
+    <button class="btn s" onclick="MS=(page==='sales')?null:{type:'saleslist'};render();">← رجوع للقائمة</button>
     <button class="btn s" id="mc2">إغلاق</button>
   </div>
   </div></div>`;
