@@ -366,6 +366,12 @@ def init_db():
         c.execute("ALTER TABLE payments ADD COLUMN cheque_image TEXT DEFAULT ''")
         c.commit()
     except: pass
+    # أعمدة تظهير الشيك: endorsed_to = رقم دفعة المورد المظهَّر لها، endorsed_from = رقم دفعة الزبون الأصلية
+    for _col in ("endorsed_to", "endorsed_from"):
+        try:
+            c.execute(f"ALTER TABLE payments ADD COLUMN {_col} INTEGER DEFAULT 0")
+            c.commit()
+        except: pass
     # إضافة عمود تتبع السيريال الفريد للمنتجات (للقواعد القديمة)
     try:
         c.execute("ALTER TABLE products ADD COLUMN track_serial INTEGER DEFAULT 0")
@@ -1646,6 +1652,15 @@ class ReportsDAO(BaseDAO):
                 p["party_phone"] = cust["phone"] if cust else ""
                 p["direction"] = "وارد"
             p["cheque_status"] = p["cheque_status"] or "قيد التحصيل"
+            if p.get("endorsed_to"):        # شيك زبون مظهَّر: لمن؟ وما حالته عند المورد؟
+                tp = PaymentsDAO.get_by_id(c, p["endorsed_to"])
+                sp = SuppliersDAO.get_by_id(c, tp["party_id"]) if tp else None
+                p["endorsed_to_name"] = sp["name"] if sp else "—"
+                p["endorsed_to_status"] = (tp.get("cheque_status") or "قيد التحصيل") if tp else ""
+            if p.get("endorsed_from"):      # دفعة مورد أصلها شيك زبون
+                op = PaymentsDAO.get_by_id(c, p["endorsed_from"])
+                cp = CustomersDAO.get_by_id(c, op["party_id"]) if op else None
+                p["endorsed_from_name"] = cp["name"] if cp else "—"
         total_out = sum(p["amount"] for p in pays if p["party_type"] == "supplier")
         total_in = sum(p["amount"] for p in pays if p["party_type"] == "customer")
         return {"cheques": pays, "total_outgoing": total_out,
@@ -2805,6 +2820,67 @@ def handle_api(method, path, body, req):
             c.close(); return 404,{"detail":"الزبون غير موجود"}
         c.close(); return 200, result
 
+    # ── تظهير شيك وارد من زبون إلى مورد كدفعة (الشيك نفسه يُسلَّم للمورد) ──
+    if ep == "cheque_endorse" and method == "POST":
+        if not (user_can_page(u, "accounting") or user_can_page(u, "purchases")):
+            c.close(); return 403, {"detail": "غير مصرح — تظهير الشيك يحتاج صلاحية الحسابات أو المشتريات"}
+        pid = body.get("payment_id"); sup_id = body.get("supplier_id")
+        target = body.get("ref_type") or "account"
+        try: ref_id = int(body.get("ref_id") or 0)
+        except (TypeError, ValueError): ref_id = 0
+        pay = PaymentsDAO.get_by_id(c, pid) if pid else None
+        if not pay: c.close(); return 404, {"detail": "الشيك غير موجود"}
+        if pay["party_type"] != "customer" or pay["method"] != "شيك":
+            c.close(); return 400, {"detail": "يمكن تظهير الشيكات الواردة من الزبائن فقط"}
+        status = pay.get("cheque_status") or "قيد التحصيل"
+        if status == "مُظهَّر" or pay.get("endorsed_to"):
+            c.close(); return 400, {"detail": "هذا الشيك مظهَّر مسبقًا"}
+        if status in ("محصّل", "مرتجع"):
+            c.close(); return 400, {"detail": f"لا يمكن تظهير شيك حالته «{status}»"}
+        sup = SuppliersDAO.get_by_id(c, sup_id) if sup_id else None
+        if not sup: c.close(); return 404, {"detail": "المورد غير موجود"}
+        if target not in ("account", "purchase"):
+            c.close(); return 400, {"detail": "جهة الدفع غير صحيحة"}
+        if target == "purchase":
+            pur = PurchasesDAO.get_by_id(c, ref_id)
+            if not pur or str(pur.get("supplier_id")) != str(sup_id) or (pur.get("total") or 0) <= 0 or pur.get("status") == "مردود":
+                c.close(); return 400, {"detail": "فاتورة الشراء غير صالحة لهذا المورد"}
+            remaining = pur["total"] - PaymentsDAO.total_by_ref(c, "purchase", ref_id)
+            if pay["amount"] > remaining + 0.005:
+                c.close(); return 400, {"detail": f"مبلغ الشيك أكبر من المتبقي على الفاتورة ({remaining}) — اختر «على حساب المورد»"}
+        else:
+            ref_id = 0
+        cust = CustomersDAO.get_by_id(c, pay["party_id"])
+        note = f"شيك مظهَّر من الزبون {cust['name'] if cust else '—'} (دفعة #{pid})" + (f" — {body['notes']}" if body.get("notes") else "")
+        new_id = PaymentsDAO.create(c, target, ref_id, "supplier", int(sup_id), pay["amount"], "شيك",
+                                    body.get("date") or pay["date"], pay["cheque_no"], pay["cheque_date"],
+                                    pay["cheque_bank"], pay.get("cheque_image", ""), note)
+        c.execute("UPDATE payments SET endorsed_from=? WHERE id=?", (pid, new_id))
+        c.execute("UPDATE payments SET cheque_status='مُظهَّر', endorsed_to=? WHERE id=?", (new_id, pid))
+        if target == "purchase": PaymentsDAO.update_invoice_status(c, "purchase", ref_id)
+        c.commit()
+        res = {"original": PaymentsDAO.get_by_id(c, pid), "supplier_payment": PaymentsDAO.get_by_id(c, new_id)}
+        c.close(); return 201, res
+
+    if ep == "cheque_endorse_cancel" and method == "POST":
+        if not (user_can_page(u, "accounting") or user_can_page(u, "purchases")):
+            c.close(); return 403, {"detail": "غير مصرح"}
+        pay = PaymentsDAO.get_by_id(c, body.get("payment_id")) if body.get("payment_id") else None
+        if not pay: c.close(); return 404, {"detail": "الشيك غير موجود"}
+        orig_id = pay["id"] if pay.get("endorsed_to") else pay.get("endorsed_from")
+        if not orig_id: c.close(); return 400, {"detail": "هذا الشيك غير مظهَّر"}
+        orig = PaymentsDAO.get_by_id(c, orig_id)
+        sup_pay = PaymentsDAO.get_by_id(c, orig["endorsed_to"]) if orig and orig.get("endorsed_to") else None
+        if sup_pay and (sup_pay.get("cheque_status") == "محصّل"):
+            c.close(); return 400, {"detail": "لا يمكن إلغاء التظهير: الشيك حُصِّل لدى المورد"}
+        if sup_pay:
+            PaymentsDAO.delete(c, sup_pay["id"])
+            PaymentsDAO.update_invoice_status(c, sup_pay["ref_type"], sup_pay["ref_id"])
+        c.execute("UPDATE payments SET cheque_status='قيد التحصيل', endorsed_to=0 WHERE id=?", (orig_id,))
+        c.commit()
+        res = PaymentsDAO.get_by_id(c, orig_id)
+        c.close(); return 200, res
+
     # ── PAYMENTS ──
     if ep == "payments":
         if method == "GET":
@@ -2840,6 +2916,14 @@ def handle_api(method, path, body, req):
             pay = PaymentsDAO.get_by_id(c, pid)
             if not pay:
                 c.close(); return 404, {"detail":"الدفعة غير موجودة"}
+            if pay.get("endorsed_to"):
+                c.close(); return 400, {"detail": "هذا الشيك مظهَّر لمورد — ألغِ التظهير أولًا"}
+            if pay.get("endorsed_from"):
+                orig = PaymentsDAO.get_by_id(c, pay["endorsed_from"])
+                if pay.get("cheque_status") == "محصّل":
+                    c.close(); return 400, {"detail": "لا يمكن حذف دفعة شيك حُصِّل لدى المورد"}
+                if orig:      # حذف دفعة المورد = إلغاء التظهير: يعود الشيك للمحفظة
+                    c.execute("UPDATE payments SET cheque_status='قيد التحصيل', endorsed_to=0 WHERE id=?", (orig["id"],))
             PaymentsDAO.delete(c, pid)
             c.commit()
             PaymentsDAO.update_invoice_status(c, pay["ref_type"], pay["ref_id"])
@@ -2847,6 +2931,15 @@ def handle_api(method, path, body, req):
             c.close(); return 200, {"ok": True}
         if method == "PUT" and len(parts)==3:
             pid = int(parts[2])
+            cur_pay = PaymentsDAO.get_by_id(c, pid)
+            if cur_pay:
+                is_endorsed = bool(cur_pay.get("endorsed_to") or cur_pay.get("endorsed_from"))
+                if is_endorsed and body.get("amount") is not None and abs(float(body["amount"]) - cur_pay["amount"]) > 0.005:
+                    c.close(); return 400, {"detail": "لا يمكن تغيير مبلغ شيك مظهَّر — ألغِ التظهير أولًا"}
+                if cur_pay.get("endorsed_to") and body.get("cheque_status") not in (None, "", "مُظهَّر"):
+                    c.close(); return 400, {"detail": "الشيك مظهَّر لمورد — ألغِ التظهير قبل تغيير حالته"}
+                if body.get("cheque_status") == "مُظهَّر" and not cur_pay.get("endorsed_to"):
+                    c.close(); return 400, {"detail": "حالة «مُظهَّر» تُضبط عبر التظهير فقط"}
             old = PaymentsDAO.update(c, pid,
                 amount=body.get("amount"), method=body.get("method"),
                 date=body.get("date"), notes=body.get("notes"),
@@ -5557,6 +5650,7 @@ function repContent(type){
             <option value="محصّل">محصّل</option>
             <option value="مرتجع">مرتجع</option>
             <option value="مؤجل">مؤجل</option>
+            <option value="مُظهَّر">مُظهَّر (إلى مورد)</option>
           </select>
         </div>
         <div>
@@ -6836,6 +6930,7 @@ function modalHTML(){
   if(MS?.type==='payhist') return payHistModal(MS.data||{});
   if(MS.type==='userform') return userModal(MS.data||{});
   if(MS.type==='chequeStatus') return chequeStatusModal(MS.data||{});
+  if(MS.type==='chequeEndorse') return chequeEndorseModal(MS.data||{});
   if(MS.type==='saleslist')  return salesListModal();
   if(MS.type==='editsale')   return editSaleModal(MS.data||{});
   if(MS.type==='accountpay') return accountPayModal(MS.data||{});
@@ -9626,6 +9721,25 @@ function bindModal(){
     };
   }
 
+  // ── تظهير شيك ──
+  if(MS?.type==='chequeEndorse'){
+    document.getElementById('ms').onclick = async()=>{
+      const errEl = document.getElementById('merr');
+      const sup = document.getElementById('end-sup')?.value;
+      if(!sup){ errEl.innerHTML='<div class="err">اختر المورد</div>'; return; }
+      const t = document.getElementById('end-target')?.value || 'account';
+      const isPur = t.startsWith('purchase:');
+      try{
+        await api('POST','/api/cheque_endorse',{
+          payment_id: MS.data.id, supplier_id: parseInt(sup),
+          ref_type: isPur ? 'purchase' : 'account', ref_id: isPur ? parseInt(t.split(':')[1]) : 0,
+          date: document.getElementById('end-date')?.value || '', notes: document.getElementById('end-notes')?.value || ''});
+        closeM(); await loadAll(); await loadCheques();
+        alert('✅ تم تظهير الشيك للمورد وتسجيل الدفعة');
+      }catch(e){ errEl.innerHTML = '<div class="err">'+e.message+'</div>'; }
+    };
+  }
+
   // ── مردود مشتريات ──
   if(MS?.type==='retpur'){
     document.getElementById('ms').onclick=async()=>{
@@ -11532,7 +11646,9 @@ function chequesHTML(d){
     'محصّل':       {cls:'g', icon:'✅'},
     'مرتجع':       {cls:'r', icon:'↩️'},
     'مؤجل':        {cls:'b', icon:'📅'},
+    'مُظهَّر':       {cls:'b', icon:'🔁'},
   };
+  window._chqRows = cheques;
 
   if(!cheques.length) return `
     <div class="card" style="padding:28px;text-align:center;color:#64748b;">
@@ -11611,6 +11727,8 @@ function chequesHTML(d){
           <td style="color:#64748b;font-size:12px;">${ch.date}</td>
           <td>
             <span class="badge ${st.cls}">${st.icon} ${ch.cheque_status}</span>
+            ${ch.endorsed_to_name?`<div style="font-size:10px;color:#94a3b8;margin-top:3px;">إلى المورد: ${esc(ch.endorsed_to_name)} (${esc(ch.endorsed_to_status||'')})</div>`:''}
+            ${ch.endorsed_from_name?`<div style="font-size:10px;color:#94a3b8;margin-top:3px;">مظهَّر من الزبون: ${esc(ch.endorsed_from_name)}</div>`:''}
           </td>
           <td style="text-align:center;">
             ${hasImg
@@ -11619,19 +11737,21 @@ function chequesHTML(d){
               : `<span style="color:#334155;font-size:11px;">—</span>`}
           </td>
           <td style="font-size:12px;color:#64748b;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${safeNotes}">${ch.notes||'—'}</td>
-          <td>
-            <button class="btn s" style="padding:3px 8px;font-size:11px;white-space:nowrap;"
-              onclick="chqOpenUpdate(${ch.id})">
-              ✏️ تحديث
-            </button>
-          </td>
+          <td><div style="display:flex;gap:4px;flex-wrap:wrap;">
+            ${ch.endorsed_to ? '' : `<button class="btn s" style="padding:3px 8px;font-size:11px;white-space:nowrap;"
+              onclick="chqOpenUpdate(${ch.id})">✏️ تحديث</button>`}
+            ${(ch.direction==='وارد' && !ch.endorsed_to && ['قيد التحصيل','مؤجل'].includes(ch.cheque_status)) ? `<button class="btn p" style="padding:3px 8px;font-size:11px;white-space:nowrap;background:linear-gradient(135deg,#1e40af,#1e3a8a);"
+              onclick="chqOpenEndorse(${ch.id})">🔁 تظهير لمورد</button>` : ''}
+            ${(ch.endorsed_to || ch.endorsed_from) ? `<button class="btn s" style="padding:3px 8px;font-size:11px;white-space:nowrap;color:#fbbf24;border-color:#5c4a23;"
+              onclick="chqCancelEndorse(${ch.id})">↩️ إلغاء التظهير</button>` : ''}
+          </div></td>
         </tr>`;
       }).join('')}
       </tbody>
     </table>
     <!-- إجمالي الحالات -->
     <div style="display:flex;gap:10px;padding:12px 16px;border-top:1px solid #1e2537;flex-wrap:wrap;">
-      ${['قيد التحصيل','محصّل','مرتجع','مؤجل'].map(s=>{
+      ${['قيد التحصيل','محصّل','مرتجع','مؤجل','مُظهَّر'].map(s=>{
         const grp = cheques.filter(c=>c.cheque_status===s);
         if(!grp.length) return '';
         const st = statusStyle[s]||{cls:'b',icon:'❓'};
@@ -11643,6 +11763,65 @@ function chequesHTML(d){
       }).join('')}
     </div>
   </div>`;
+}
+
+// ── تظهير شيك وارد من زبون إلى مورد كدفعة ──
+window.chqOpenEndorse = function(id){
+  const ch = (window._chqRows||[]).find(x=>x.id===id);
+  if(!ch){ alert('الشيك غير موجود في القائمة الحالية'); return; }
+  MS = {type:'chequeEndorse', data:{id, cheque:ch, supplier:'', target:'account'}};
+  render();
+};
+window.chqEndorseSet = function(k,v){
+  const d = MS.data; d[k]=v; if(k==='supplier') d.target='account';
+  d.notes = document.getElementById('end-notes')?.value||''; d.date = document.getElementById('end-date')?.value||d.date;
+  render();
+};
+window.chqCancelEndorse = async function(id){
+  if(!confirm('سيُلغى التظهير: تُحذف دفعة المورد المرتبطة ويعود الشيك إلى حالة «قيد التحصيل». متابعة؟')) return;
+  try{ await api('POST','/api/cheque_endorse_cancel',{payment_id:id}); await loadAll(); await loadCheques(); }
+  catch(e){ alert('خطأ: '+e.message); }
+};
+function chequeEndorseModal(d){
+  const ch = d.cheque||{};
+  const supId = d.supplier ? parseInt(d.supplier) : 0;
+  const invs = !supId ? [] : purchases.filter(p=>parseInt(p.supplier_id)===supId && p.status!=='مردود' && (p.total||0)>0
+                                                && (p.remaining||0) >= (ch.amount||0) - 0.005);
+  const today = new Date().toISOString().slice(0,10);
+  return `<div class="overlay" id="mover"><div class="modal" style="max-width:540px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+    <div style="font-size:16px;font-weight:800;color:#60a5fa;">🔁 تظهير شيك لمورد</div>
+    <button class="btn s" style="padding:4px 9px;" id="mc">✕</button>
+  </div>
+  <div id="merr"></div>
+  <div style="background:#1a1d27;border:1px solid #1e3a5f;border-radius:8px;padding:12px;margin-bottom:14px;font-size:13px;">
+    <div style="display:flex;justify-content:space-between;"><span style="color:#94a3b8;">الشيك</span><b style="font-family:monospace;color:#60a5fa;">#${esc(ch.cheque_no||'—')}</b></div>
+    <div style="display:flex;justify-content:space-between;margin-top:4px;"><span style="color:#94a3b8;">البنك / تاريخ الاستحقاق</span><span>${esc(ch.cheque_bank||'—')} / ${ch.cheque_date||'—'}</span></div>
+    <div style="display:flex;justify-content:space-between;margin-top:4px;"><span style="color:#94a3b8;">من الزبون</span><span>${esc(ch.party_name||'—')}</span></div>
+    <div style="display:flex;justify-content:space-between;margin-top:4px;"><span style="color:#94a3b8;">المبلغ</span><b style="color:#52b788;">${(ch.amount||0).toLocaleString()} ${cur()}</b></div>
+  </div>
+  <div class="g2" style="margin-bottom:12px;">
+    <div><label class="lbl">المورد (المستلِم للشيك)</label>
+      <select class="inp" id="end-sup" onchange="chqEndorseSet('supplier',this.value)">
+        <option value="">— اختر المورد —</option>
+        ${suppliers.map(s=>`<option value="${s.id}" ${String(s.id)===String(d.supplier)?'selected':''}>${esc(s.name)}</option>`).join('')}
+      </select></div>
+    <div><label class="lbl">تاريخ التظهير</label><input class="inp" type="date" id="end-date" value="${d.date||today}"/></div>
+  </div>
+  <div style="margin-bottom:12px;"><label class="lbl">تسجيل الدفعة على</label>
+    <select class="inp" id="end-target" onchange="chqEndorseSet('target',this.value)" ${supId?'':'disabled'}>
+      <option value="account" ${d.target==='account'?'selected':''}>حساب المورد (دفعة عامة)</option>
+      ${invs.map(p=>`<option value="purchase:${p.id}" ${d.target==='purchase:'+p.id?'selected':''}>فاتورة شراء #${p.id} — ${p.date} — المتبقي ${(p.remaining||0).toLocaleString()} ${cur()}</option>`).join('')}
+    </select>
+    ${supId && !invs.length ? `<div style="font-size:11px;color:#64748b;margin-top:4px;">لا توجد فواتير غير مسددة بمبلغ يكفي لتغطية قيمة الشيك — سيُسجَّل على الحساب.</div>` : ''}
+  </div>
+  <div style="margin-bottom:12px;"><label class="lbl">ملاحظات</label><input class="inp" id="end-notes" value="${esc(d.notes||'')}" placeholder="اختياري"/></div>
+  <div style="font-size:12px;color:#64748b;margin-bottom:12px;">يبقى الشيك مسجَّلًا كدفعة من الزبون (يظهر بحالة «مُظهَّر»)، وتُسجَّل دفعة بالقيمة نفسها للمورد وتخفض المستحق له. يمكن إلغاء التظهير ما لم يُحصَّل الشيك لدى المورد.</div>
+  <div style="display:flex;gap:10px;">
+    <button class="btn p" style="background:linear-gradient(135deg,#1e40af,#1e3a8a);" id="ms">🔁 تأكيد التظهير</button>
+    <button class="btn s" id="mc2">إلغاء</button>
+  </div>
+  </div></div>`;
 }
 
 // مودال تحديث حالة الشيك
